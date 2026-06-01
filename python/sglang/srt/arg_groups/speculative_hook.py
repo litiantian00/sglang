@@ -274,17 +274,21 @@ def _handle_eagle_family(server_args: "ServerArgs") -> None:
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
         )
 
-    # Spec v2 (the only remaining eagle/eagle3/standalone implementation) only
-    # supports topk == 1. Spec v1, which handled topk > 1 tree drafting, has
-    # been removed, so topk > 1 is no longer supported on this path.
+    # Spec v2 (the only remaining eagle/eagle3/standalone implementation)
+    # supports tree drafting (topk > 1) only with page_size == 1. The
+    # page_size > 1 + topk > 1 draft KV allocation (partial-page duplication)
+    # was handled by spec v1, which has been removed, so that combination is
+    # no longer supported.
     if (
         server_args.speculative_eagle_topk is not None
         and server_args.speculative_eagle_topk > 1
+        and server_args.page_size > 1
     ):
         raise ValueError(
-            "EAGLE/EAGLE3/STANDALONE speculative decoding currently only supports "
-            "speculative_eagle_topk == 1 (spec v1 removed; spec v2 tree drafting "
-            "with topk > 1 is not yet supported). Set --speculative-eagle-topk 1."
+            "EAGLE/EAGLE3/STANDALONE speculative decoding with "
+            "speculative_eagle_topk > 1 requires page_size == 1 (spec v1 removed; "
+            "spec v2 tree drafting with topk > 1 is only supported for "
+            "page_size == 1). Set --speculative-eagle-topk 1 or --page-size 1."
         )
 
     # SGLANG_ENABLE_SPEC_V2=False selects the non-overlap (synchronous) spec v2
