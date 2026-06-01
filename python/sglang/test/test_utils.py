@@ -871,7 +871,8 @@ def _wait_for_server_health(
 
 # EAGLE/EAGLE3/STANDALONE algorithm names that route through
 # `_handle_eagle_family` (NEXTN is the eagle alias). Spec v1 (which handled
-# topk > 1) has been removed and spec v2 only supports topk == 1.
+# topk > 1 with page_size > 1) has been removed; spec v2 supports topk > 1
+# tree drafting only with page_size == 1.
 _EAGLE_FAMILY_SPEC_ALGOS = {"EAGLE", "EAGLE3", "NEXTN", "STANDALONE"}
 
 
@@ -889,7 +890,9 @@ def _arg_value(command: list, name: str) -> Optional[str]:
 
 
 def _skip_if_unsupported_spec_topk(command: list) -> None:
-    """Raise ``unittest.SkipTest`` for eagle-family spec configs with topk > 1.
+    """Raise ``unittest.SkipTest`` for eagle-family spec configs the current
+    (spec v1 removed) implementation cannot serve: topk > 1 with page_size > 1.
+    topk > 1 with page_size == 1 stays on spec v2 tree drafting.
 
     Centralizes the skip so every server-launching test inherits it, rather
     than guarding each fixture individually.
@@ -898,10 +901,13 @@ def _skip_if_unsupported_spec_topk(command: list) -> None:
     topk = _arg_value(command, "--speculative-eagle-topk")
     if algo is None or topk is None:
         return
-    if algo.upper() in _EAGLE_FAMILY_SPEC_ALGOS and int(topk) > 1:
+    page_size = _arg_value(command, "--page-size")
+    page_size = int(page_size) if page_size is not None else 1
+    if algo.upper() in _EAGLE_FAMILY_SPEC_ALGOS and int(topk) > 1 and page_size > 1:
         raise unittest.SkipTest(
-            f"{algo} spec v2 only supports speculative_eagle_topk == 1 "
-            f"(got {topk}); topk > 1 not yet supported (spec v1 removed)."
+            f"{algo} spec decoding with speculative_eagle_topk={topk} requires "
+            f"page_size == 1 (got {page_size}); topk > 1 + page_size > 1 not "
+            f"supported (spec v1 removed)."
         )
 
 
