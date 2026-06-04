@@ -203,9 +203,10 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             self.draft_extend_attn_backend_list.append(
                 draft_backend_factory.create_draft_extend_backend()
             )
-            self.draft_runner_list[step].attn_backend = (
-                self.draft_extend_attn_backend_list[-1]
-            )
+            if self.draft_extend_attn_backend_list[-1] is not None:
+                self.draft_runner_list[step].attn_backend = (
+                    self.draft_extend_attn_backend_list[-1]
+                )
 
     def init_cuda_graphs(self):
         """Capture cuda graphs."""
@@ -674,7 +675,13 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
     def spec_v2_attn_backends(self) -> tuple:
         return (
             self._target_worker.model_runner.attn_backend,
-            *self._draft_worker.draft_extend_attn_backend_list,
+            *(
+                backend or runner.attn_backend
+                for backend, runner in zip(
+                    self._draft_worker.draft_extend_attn_backend_list,
+                    self._draft_worker.draft_runner_list,
+                )
+            ),
         )
 
     def clear_cache_pool(self):

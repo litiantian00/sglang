@@ -311,7 +311,8 @@ class EagleDraftWorker(BaseDraftWorker):
         )
 
         self.draft_runner.draft_attn_backend = self.draft_attn_backend
-        self.draft_runner.attn_backend = self.draft_extend_attn_backend
+        if self.draft_extend_attn_backend is not None:
+            self.draft_runner.attn_backend = self.draft_extend_attn_backend
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
 
     def init_cuda_graphs(self):
@@ -857,7 +858,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
         return (
             self._target_worker.model_runner.attn_backend,
             self._draft_worker.draft_attn_backend,
-            self._draft_worker.draft_extend_attn_backend,
+            self._draft_worker.draft_extend_attn_backend
+            or self._draft_worker.draft_runner.attn_backend,
         )
 
     def alloc_memory_pool(
