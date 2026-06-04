@@ -1015,9 +1015,30 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 global_forward_mode=global_forward_mode,
             )
 
+        if capture_kind is CaptureKind.DUMMY_RUN:
+            return cls._init_dummy_run_capture(
+                buffers=buffers,
+                bs=bs,
+                num_tokens=num_tokens,
+                forward_mode=forward_mode,
+                extend_num_tokens=extend_num_tokens,
+                extend_seq_lens=extend_seq_lens,
+                extend_prefix_lens=extend_prefix_lens,
+                extend_start_loc=extend_start_loc,
+                extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+                extend_seq_lens_cpu=extend_seq_lens_cpu,
+                spec_info=spec_info,
+                spec_algorithm=spec_algorithm,
+                capture_hidden_mode=capture_hidden_mode,
+                global_num_tokens_cpu=global_num_tokens_cpu,
+                global_dp_buffer_len=global_dp_buffer_len,
+                global_forward_mode=global_forward_mode,
+                lora_ids=lora_ids,
+            )
+
         assert (
             forward_mode is not None and input_ids is not None
-        ), "DUMMY_RUN capture must pass forward_mode and core tensors"
+        ), "unexpected capture_kind for the parameter-by-parameter path"
 
         # Per-kind default for global_forward_mode: capture paths mirror the
         # primary forward_mode unless caller passes an explicit override.
@@ -1279,6 +1300,73 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             lora_ids=lora_ids,
             rids_int=rids_int,
             bootstrap_room_ids_int=bootstrap_room_ids_int,
+        )
+
+    @classmethod
+    def _init_dummy_run_capture(
+        cls,
+        *,
+        buffers: Optional["SimpleNamespace"],
+        bs: int,
+        num_tokens: int,
+        forward_mode: Optional[ForwardMode],
+        extend_num_tokens: Optional[int] = None,
+        extend_seq_lens: Optional[torch.Tensor] = None,
+        extend_prefix_lens: Optional[torch.Tensor] = None,
+        extend_start_loc: Optional[torch.Tensor] = None,
+        extend_prefix_lens_cpu: Optional[List[int]] = None,
+        extend_seq_lens_cpu: Optional[List[int]] = None,
+        spec_info: Optional["SpecInput"] = None,
+        spec_algorithm: Optional["SpeculativeAlgorithm"] = None,
+        capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL,
+        global_num_tokens_cpu: Optional[List[int]] = None,
+        global_dp_buffer_len: Optional[int] = None,
+        global_forward_mode: Optional[ForwardMode] = None,
+        lora_ids: Optional[List[Optional[str]]] = None,
+    ) -> "ForwardBatch":
+        """Build a dummy-run (warmup / DP-measure) capture ForwardBatch.
+
+        Reads the decode-buffer namespace directly — unlike FULL_GRAPH it uses
+        the full (unsliced) buffers and has no registry. The caller owns the
+        extend metadata (computed from `is_generation`) and the spec / lora /
+        dp values, and passes them in.
+        """
+        assert buffers is not None, "dummy-run capture requires decode buffers"
+        if global_forward_mode is None:
+            global_forward_mode = forward_mode
+
+        return cls(
+            forward_mode=forward_mode,
+            batch_size=bs,
+            input_ids=buffers.input_ids,
+            req_pool_indices=buffers.req_pool_indices,
+            seq_lens=buffers.seq_lens,
+            seq_lens_cpu=buffers.seq_lens_cpu,
+            next_token_logits_buffer=buffers.next_token_logits_buffer,
+            orig_seq_lens=buffers.seq_lens,
+            out_cache_loc=buffers.out_cache_loc,
+            seq_lens_sum=buffers.seq_lens.sum().item(),
+            encoder_lens=buffers.encoder_lens,
+            return_logprob=False,
+            positions=buffers.positions,
+            extend_num_tokens=extend_num_tokens,
+            extend_seq_lens=extend_seq_lens,
+            extend_prefix_lens=extend_prefix_lens,
+            extend_start_loc=extend_start_loc,
+            extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
+            global_num_tokens_gpu=buffers.global_num_tokens_gpu,
+            global_num_tokens_cpu=global_num_tokens_cpu,
+            global_num_tokens_for_logprob_gpu=buffers.global_num_tokens_for_logprob_gpu,
+            dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
+            global_dp_buffer_len=global_dp_buffer_len,
+            mrope_positions=buffers.mrope_positions,
+            spec_algorithm=spec_algorithm,
+            spec_info=spec_info,
+            capture_hidden_mode=capture_hidden_mode,
+            num_token_non_padded=buffers.num_token_non_padded,
+            global_forward_mode=global_forward_mode,
+            lora_ids=lora_ids,
         )
 
     def adjust_num_token_non_padded_for_attn_tp(self, server_args) -> None:
