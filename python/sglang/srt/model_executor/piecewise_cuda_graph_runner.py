@@ -40,7 +40,6 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.dp_attention import (
-    DpPaddingMode,
     get_attention_cp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
@@ -306,73 +305,12 @@ class PiecewiseCudaGraphRunner:
 
     def warmup_compile(self, num_tokens: int):
         """Warmup the model with a simple forward pass before CUDA graph capture."""
-        registry = self.buffer_registry
-        bs = 1
-
-        def _slot(name):
-            return registry.get_slot(name).slice_for(bs, num_tokens)
-
-        input_ids = _slot("input_ids")
-        positions = _slot("positions")
-        out_cache_loc = _slot("out_cache_loc")
-        input_embeds = (
-            _slot("input_embeds") if registry.has_slot("input_embeds") else None
-        )
-        mrope_positions = (
-            _slot("mrope_positions") if registry.has_slot("mrope_positions") else None
-        )
-        mamba_track_indices = (
-            _slot("mamba_track_indices")
-            if registry.has_slot("mamba_track_indices")
-            else None
-        )
-        mamba_track_mask = (
-            _slot("mamba_track_mask") if registry.has_slot("mamba_track_mask") else None
-        )
-        mamba_track_seqlens = (
-            _slot("mamba_track_seqlens")
-            if registry.has_slot("mamba_track_seqlens")
-            else None
-        )
         with torch.device(self.device):
             forward_batch = ForwardBatch.init_for_capture(
                 capture_kind=CaptureKind.PIECEWISE_WARMUP_COMPILE,
+                registry=self.buffer_registry,
                 bs=1,
                 num_tokens=num_tokens,
-                forward_mode=ForwardMode.EXTEND,
-                input_ids=input_ids,
-                input_embeds=input_embeds,
-                req_pool_indices=torch.arange(1, device=self.device),
-                seq_lens=torch.tensor([num_tokens], device=self.device),
-                next_token_logits_buffer=None,
-                orig_seq_lens=torch.tensor([num_tokens], device=self.device),
-                seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
-                out_cache_loc=out_cache_loc,
-                seq_lens_sum=num_tokens,
-                mamba_track_indices=mamba_track_indices,
-                mamba_track_mask=mamba_track_mask,
-                mamba_track_seqlens=mamba_track_seqlens,
-                encoder_lens=None,
-                extend_num_tokens=num_tokens,
-                extend_seq_lens=torch.tensor([num_tokens], device=self.device),
-                extend_prefix_lens=torch.tensor([0], device=self.device),
-                extend_start_loc=torch.tensor([0], device=self.device),
-                extend_prefix_lens_cpu=torch.tensor([0], device="cpu"),
-                extend_seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
-                extend_logprob_start_lens_cpu=torch.tensor([num_tokens], device="cpu"),
-                positions=positions,
-                global_num_tokens_gpu=None,
-                global_num_tokens_for_logprob_gpu=None,
-                dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
-                global_dp_buffer_len=None,
-                mrope_positions=mrope_positions,
-                spec_algorithm=None,
-                spec_info=None,
-                capture_hidden_mode=CaptureHiddenMode.NULL,
-                num_token_non_padded=None,
-                num_token_non_padded_cpu=num_tokens,
-                global_forward_mode=ForwardMode.EXTEND,
-                lora_ids=None,
                 return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
             )
 
@@ -465,37 +403,8 @@ class PiecewiseCudaGraphRunner:
                     self.capture_one_batch_size(num_tokens)
 
     def capture_one_batch_size(self, num_tokens: int):
-        registry = self.buffer_registry
         bs = 1
-
-        # Graph inputs — views into the registry's (adopted) graph-resident
-        # slots; capture burns these addresses into the graph.
-        def _slot(name):
-            return registry.get_slot(name).slice_for(bs, num_tokens)
-
-        input_ids = _slot("input_ids")
-        positions = _slot("positions")
-        out_cache_loc = _slot("out_cache_loc")
-        input_embeds = (
-            _slot("input_embeds") if registry.has_slot("input_embeds") else None
-        )
-        mrope_positions = (
-            _slot("mrope_positions") if registry.has_slot("mrope_positions") else None
-        )
-        mamba_track_indices = (
-            _slot("mamba_track_indices")
-            if registry.has_slot("mamba_track_indices")
-            else None
-        )
-        mamba_track_mask = (
-            _slot("mamba_track_mask") if registry.has_slot("mamba_track_mask") else None
-        )
-        mamba_track_seqlens = (
-            _slot("mamba_track_seqlens")
-            if registry.has_slot("mamba_track_seqlens")
-            else None
-        )
-
+        # Used by run_once() below (kept None here; the FB carries None too).
         global_dp_buffer_len = None
         global_num_tokens_cpu = None
 
@@ -509,42 +418,9 @@ class PiecewiseCudaGraphRunner:
         with torch.device(self.device):
             forward_batch = ForwardBatch.init_for_capture(
                 capture_kind=CaptureKind.PIECEWISE_GRAPH,
+                registry=self.buffer_registry,
                 bs=bs,
                 num_tokens=num_tokens,
-                forward_mode=ForwardMode.EXTEND,
-                input_ids=input_ids,
-                input_embeds=input_embeds,
-                req_pool_indices=torch.arange(bs, device=self.device),
-                seq_lens=torch.tensor([num_tokens], device=self.device),
-                next_token_logits_buffer=None,
-                orig_seq_lens=torch.tensor([num_tokens], device=self.device),
-                seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
-                out_cache_loc=out_cache_loc,
-                seq_lens_sum=num_tokens,
-                mamba_track_indices=mamba_track_indices,
-                mamba_track_mask=mamba_track_mask,
-                mamba_track_seqlens=mamba_track_seqlens,
-                encoder_lens=None,
-                extend_num_tokens=num_tokens,
-                extend_seq_lens=torch.tensor([num_tokens], device=self.device),
-                extend_prefix_lens=torch.tensor([0], device=self.device),
-                extend_start_loc=torch.tensor([0], device=self.device),
-                extend_prefix_lens_cpu=torch.tensor([0], device="cpu"),
-                extend_seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
-                extend_logprob_start_lens_cpu=torch.tensor([num_tokens], device="cpu"),
-                positions=positions,
-                global_num_tokens_gpu=None,
-                global_num_tokens_for_logprob_gpu=None,
-                dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
-                global_dp_buffer_len=None,
-                mrope_positions=mrope_positions,
-                spec_algorithm=None,
-                spec_info=None,
-                capture_hidden_mode=CaptureHiddenMode.NULL,
-                num_token_non_padded=None,
-                num_token_non_padded_cpu=num_tokens,
-                global_forward_mode=ForwardMode.EXTEND,
-                lora_ids=None,
                 return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
             )
         # Setup hooks below read get_attn_backend() and must run inside the

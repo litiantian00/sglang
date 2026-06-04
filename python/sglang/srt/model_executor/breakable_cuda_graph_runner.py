@@ -241,11 +241,9 @@ class BreakableCudaGraphRunner:
         Captured kernels run only on the token-major layer stack and are
         bs-invariant.
         """
-        from sglang.srt.layers.dp_attention import DpPaddingMode
         from sglang.srt.model_executor.forward_batch_info import (
             CaptureKind,
             ForwardBatch,
-            ForwardMode,
         )
 
         spec_info = None
@@ -256,63 +254,13 @@ class BreakableCudaGraphRunner:
                 hidden_states=self.static_draft_hidden_states[:num_tokens],
             )
 
-        registry = self.buffer_registry
-        bs = 1
-
-        def _slot(name):
-            return registry.get_slot(name).slice_for(bs, num_tokens)
-
-        with torch.device(self.device):
-            seq_lens = torch.full((bs,), num_tokens, dtype=torch.int64)
-            extend_seq_lens = torch.full((bs,), num_tokens, dtype=torch.int64)
-            extend_prefix_lens = torch.zeros((bs,), dtype=torch.int64)
-            extend_start_loc = torch.zeros((bs,), dtype=torch.int64)
-            req_pool_indices = torch.arange(bs, dtype=torch.int64)
-            orig_seq_lens = torch.full((bs,), num_tokens, dtype=torch.int64)
-
         return ForwardBatch.init_for_capture(
             capture_kind=CaptureKind.BREAKABLE_GRAPH,
-            bs=bs,
+            registry=self.buffer_registry,
+            bs=1,
             num_tokens=num_tokens,
-            forward_mode=ForwardMode.EXTEND,
-            input_ids=_slot("input_ids"),
-            input_embeds=(
-                _slot("input_embeds") if registry.has_slot("input_embeds") else None
-            ),
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            next_token_logits_buffer=None,
-            orig_seq_lens=orig_seq_lens,
-            seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
-            out_cache_loc=_slot("out_cache_loc"),
-            seq_lens_sum=num_tokens,
-            mamba_track_indices=None,
-            mamba_track_mask=None,
-            mamba_track_seqlens=None,
-            encoder_lens=None,
-            extend_num_tokens=num_tokens,
-            extend_seq_lens=extend_seq_lens,
-            extend_prefix_lens=extend_prefix_lens,
-            extend_start_loc=extend_start_loc,
-            extend_prefix_lens_cpu=torch.tensor([0], device="cpu"),
-            extend_seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
-            extend_logprob_start_lens_cpu=torch.tensor([num_tokens], device="cpu"),
-            positions=_slot("positions"),
-            global_num_tokens_gpu=None,
-            global_num_tokens_for_logprob_gpu=None,
-            dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
-            global_dp_buffer_len=None,
-            mrope_positions=(
-                _slot("mrope_positions")
-                if registry.has_slot("mrope_positions")
-                else None
-            ),
-            spec_algorithm=None,
             spec_info=spec_info,
             capture_hidden_mode=self.capture_hidden_mode,
-            num_token_non_padded=None,
-            global_forward_mode=ForwardMode.EXTEND,
-            lora_ids=None,
         )
 
     def _warmup(self):

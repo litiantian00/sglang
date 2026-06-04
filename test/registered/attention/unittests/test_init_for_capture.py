@@ -34,6 +34,34 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=3, suite="base-test-cpu")
 
 
+class _FakeSlot:
+    """Stand-in for GraphSlot: returns its tensor verbatim from slice_for."""
+
+    def __init__(self, tensor: torch.Tensor):
+        self._tensor = tensor
+
+    def slice_for(self, padded_bs: int, padded_num_tokens: int) -> torch.Tensor:
+        return self._tensor
+
+
+class _FakeRegistry:
+    """Minimal CudaGraphBufferRegistry stand-in for the token-axis cases.
+
+    Holds a fixed set of named slots; the factory's token-axis path slices
+    each via get_slot(name).slice_for(...) and probes optional ones with
+    has_slot(name) (slots that are absent resolve to None, as in production).
+    """
+
+    def __init__(self, **slots: torch.Tensor):
+        self._slots = slots
+
+    def has_slot(self, name: str) -> bool:
+        return name in self._slots
+
+    def get_slot(self, name: str) -> _FakeSlot:
+        return _FakeSlot(self._slots[name])
+
+
 def _assert_fb_equal(a: ForwardBatch, b: ForwardBatch) -> None:
     """Field-by-field equality on two ForwardBatch instances.
 
@@ -272,24 +300,13 @@ class TestInitForCaptureParity(CustomTestCase):
 
             factory = ForwardBatch.init_for_capture(
                 capture_kind=CaptureKind.PIECEWISE_GRAPH,
+                registry=_FakeRegistry(
+                    input_ids=input_ids,
+                    positions=positions,
+                    out_cache_loc=out_cache_loc,
+                ),
                 bs=bs,
                 num_tokens=num_tokens,
-                forward_mode=ForwardMode.EXTEND,
-                input_ids=input_ids,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                seq_lens_cpu=seq_lens_cpu,
-                out_cache_loc=out_cache_loc,
-                seq_lens_sum=num_tokens,
-                positions=positions,
-                orig_seq_lens=orig_seq_lens,
-                extend_num_tokens=num_tokens,
-                extend_seq_lens=extend_seq_lens,
-                extend_prefix_lens=extend_prefix_lens,
-                extend_start_loc=extend_start_loc,
-                extend_prefix_lens_cpu=extend_prefix_lens_cpu,
-                extend_seq_lens_cpu=extend_seq_lens_cpu,
-                extend_logprob_start_lens_cpu=extend_logprob_start_lens_cpu,
             )
 
         _assert_fb_equal(factory, reference)
@@ -355,24 +372,13 @@ class TestInitForCaptureParity(CustomTestCase):
 
             factory = ForwardBatch.init_for_capture(
                 capture_kind=CaptureKind.PIECEWISE_WARMUP_COMPILE,
+                registry=_FakeRegistry(
+                    input_ids=input_ids,
+                    positions=positions,
+                    out_cache_loc=out_cache_loc,
+                ),
                 bs=bs,
                 num_tokens=num_tokens,
-                forward_mode=ForwardMode.EXTEND,
-                input_ids=input_ids,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                seq_lens_cpu=seq_lens_cpu,
-                out_cache_loc=out_cache_loc,
-                seq_lens_sum=num_tokens,
-                positions=positions,
-                orig_seq_lens=orig_seq_lens,
-                extend_num_tokens=num_tokens,
-                extend_seq_lens=extend_seq_lens,
-                extend_prefix_lens=extend_prefix_lens,
-                extend_start_loc=extend_start_loc,
-                extend_prefix_lens_cpu=extend_prefix_lens_cpu,
-                extend_seq_lens_cpu=extend_seq_lens_cpu,
-                extend_logprob_start_lens_cpu=extend_logprob_start_lens_cpu,
             )
 
         _assert_fb_equal(factory, reference)
@@ -432,25 +438,13 @@ class TestInitForCaptureParity(CustomTestCase):
 
         factory = ForwardBatch.init_for_capture(
             capture_kind=CaptureKind.BREAKABLE_GRAPH,
+            registry=_FakeRegistry(
+                input_ids=input_ids,
+                positions=positions,
+                out_cache_loc=out_cache_loc,
+            ),
             bs=bs,
             num_tokens=num_tokens,
-            forward_mode=ForwardMode.EXTEND,
-            input_ids=input_ids,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
-            out_cache_loc=out_cache_loc,
-            seq_lens_sum=num_tokens,
-            positions=positions,
-            orig_seq_lens=orig_seq_lens,
-            extend_num_tokens=num_tokens,
-            extend_seq_lens=extend_seq_lens,
-            extend_prefix_lens=extend_prefix_lens,
-            extend_start_loc=extend_start_loc,
-            extend_prefix_lens_cpu=torch.tensor([0], device="cpu"),
-            extend_seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
-            extend_logprob_start_lens_cpu=torch.tensor([num_tokens], device="cpu"),
-            capture_hidden_mode=CaptureHiddenMode.NULL,
         )
 
         _assert_fb_equal(factory, reference)
