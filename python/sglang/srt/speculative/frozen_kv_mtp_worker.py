@@ -131,7 +131,7 @@ class FrozenKVMTPWorker(TpModelWorker):
         )
 
         target_cfg = target_worker.model_runner.memory_pool_config
-        draft_pool_config = MemoryPoolConfig(
+        self.draft_pool_config = MemoryPoolConfig(
             max_total_num_tokens=64,  # Dummy value
             max_running_requests=target_cfg.max_running_requests,
         )
@@ -154,7 +154,7 @@ class FrozenKVMTPWorker(TpModelWorker):
                 is_draft_worker=True,
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                memory_pool_config=draft_pool_config,
+                memory_pool_config=self.draft_pool_config,
             )
 
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
@@ -179,16 +179,8 @@ class FrozenKVMTPWorker(TpModelWorker):
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
 
-        self.draft_attn_backend = self._init_draft_attn_backend()
-        self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
+        self.draft_attn_backend = None
         self.cuda_graph_runner = None
-
-        with (
-            self.draft_tp_context(self.draft_model_runner.tp_group),
-            speculative_moe_backend_context(),
-            speculative_moe_a2a_backend_context(),
-        ):
-            self.init_cuda_graphs()
 
     @property
     def draft_model_runner(self):
@@ -196,6 +188,37 @@ class FrozenKVMTPWorker(TpModelWorker):
 
     def get_attn_backend(self):  # pragma: no cover - exposed for adaptive
         return self.draft_attn_backend
+
+    def alloc_memory_pool(
+        self,
+        memory_pool_config=None,
+        req_to_token_pool=None,
+        token_to_kv_pool_allocator=None,
+    ):
+        super().alloc_memory_pool(
+            memory_pool_config=self.draft_pool_config,
+            req_to_token_pool=(
+                req_to_token_pool
+                if req_to_token_pool is not None
+                else self.req_to_token_pool
+            ),
+            token_to_kv_pool_allocator=(
+                token_to_kv_pool_allocator
+                if token_to_kv_pool_allocator is not None
+                else self.token_to_kv_pool_allocator
+            ),
+        )
+
+    def init_backends(self):
+        with (
+            self.draft_tp_context(self.draft_model_runner.tp_group),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
+            super().init_backends(disable_cuda_graph=True)
+            self.draft_attn_backend = self._init_draft_attn_backend()
+            self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
+            self.init_cuda_graphs()
 
     def clear_cache_pool(self):
         pass

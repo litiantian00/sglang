@@ -29,7 +29,7 @@ from sglang.srt.speculative.dflash_utils import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
-from sglang.srt.utils import is_cuda, is_npu
+from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_npu
 
 _is_npu = is_npu()
 
@@ -247,7 +247,17 @@ class DFlashWorker:
         )
 
     def init_backends(self):
-        self.draft_worker.init_backends()
+        disable_cuda_graph = False
+        if is_cuda() and not self.server_args.disable_cuda_graph:
+            available_mem = get_available_gpu_memory(self.device, self.gpu_id)
+            disable_cuda_graph = available_mem < 1.0
+            if disable_cuda_graph:
+                logger.warning(
+                    "Disable DFLASH draft cuda graph because only %.2f GB GPU "
+                    "memory is available after target backend initialization.",
+                    available_mem,
+                )
+        self.draft_worker.init_backends(disable_cuda_graph=disable_cuda_graph)
 
     def _init_fused_kv_helper(self) -> None:
         """Initialize the fused KV materialization helper with pre-stacked weights."""
