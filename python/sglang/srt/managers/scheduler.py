@@ -493,7 +493,6 @@ class Scheduler(
             spec_algorithm=self.spec_algorithm,
             server_args=self.server_args,
             enable_hierarchical_cache=self.enable_hierarchical_cache,
-            enable_overlap=self.enable_overlap,
             page_size=self.page_size,
         )
 
@@ -1050,7 +1049,6 @@ class Scheduler(
             draft_worker=self.draft_worker,
             spec_algorithm=self.spec_algorithm,
             server_args=self.server_args,
-            enable_overlap=self.enable_overlap,
         )
         # Default to the target model_config so the MetadataBuffers branches
         # below can always access it; overridden by the draft model_config
