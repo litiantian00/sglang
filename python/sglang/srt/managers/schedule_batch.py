@@ -2403,10 +2403,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     @property
     def is_spec_v2(self):
-        # "Uses the V2 worker / schema" (EagleDraftInput carried forward, output
-        # in the result processor). Overlap-independent: the non-overlap path
-        # also drives the V2 worker, just synchronously. Overlap-only machinery
-        # (future_map relay, on_publish, stream isolation) gates on enable_overlap.
+        # Whether the V2 worker/schema is used. Independent of overlap: the
+        # non-overlap path also drives the V2 worker, just synchronously.
         return self.spec_algorithm.supports_spec_v2()
 
     def mamba_lazy_prealloc_at_boundary(self, mamba_track_interval: int):
