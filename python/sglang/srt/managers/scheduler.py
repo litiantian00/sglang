@@ -2953,8 +2953,8 @@ class Scheduler(
         self.batch_record_buf[self.batch_record_ct] = [batch, attr_snapshot]
 
     @contextmanager
-    def _overlap_forward_isolation(self, batch: ScheduleBatch):
-        """Make SB transactional across one overlap forward.
+    def _forward_isolation(self, batch: ScheduleBatch, *, pin: bool):
+        """Make SB transactional across one forward (overlap and non-overlap).
 
         1. Snapshot SB fields so V2's mid-forward mutations (forward_mode /
            input_ids / seq_lens / spec_info / ...) can be undone. V1 / non-spec
@@ -2963,10 +2963,12 @@ class Scheduler(
         2. Substitute sampling_info with a forward-only copy (orchestrator=None,
            shares the pre-accumulated penalty buffer) so V2's multiple init_new
            calls don't double-accumulate penalties.
-        3. Pin (batch, snapshot) into batch_record_buf for 2 iters so GPU
-           tensors in the snapshot survive the caching allocator past the
-           forward stream. Must run AFTER the sampling_info swap so the
-           forward-only copy gets pinned.
+        3. (overlap only, pin=True) Pin (batch, snapshot) into batch_record_buf
+           for 2 iters so GPU tensors in the snapshot survive the caching
+           allocator past the forward stream. Must run AFTER the sampling_info
+           swap so the forward-only copy gets pinned. The non-overlap (sync) path
+           runs on a single stream and doesn't allocate batch_record_buf, so it
+           passes pin=False.
         """
         # 1. snapshot
         snapshot_v2_full = batch.is_spec_v2
@@ -2981,8 +2983,9 @@ class Scheduler(
         if sched_sampling_info is not None:
             batch.sampling_info = sched_sampling_info.copy_for_forward()
 
-        # 3. pin for 2-iter tensor lifetime
-        self.record_batch_in_overlap(batch)
+        # 3. pin for 2-iter tensor lifetime (overlap only)
+        if pin:
+            self.record_batch_in_overlap(batch)
 
         try:
             yield
@@ -2992,34 +2995,6 @@ class Scheduler(
                     setattr(batch, name, value)
             else:
                 batch.sampling_info = sched_sampling_info
-
-    @contextmanager
-    def _spec_v2_sync_forward_isolation(self, batch: ScheduleBatch):
-        """Non-overlap V2 counterpart of `_overlap_forward_isolation`.
-
-        The V2 worker mutates SB mid-forward (forward_mode / input_ids /
-        seq_lens / spec_info) and calls `init_new` multiple times, so it needs
-        the same two protections as the overlap path:
-        1. Snapshot + restore all SB fields so the mid-forward mutations are
-           undone (next-iter `prepare_for_decode` rebuilds from clean state).
-        2. Substitute sampling_info with a forward-only copy so the multiple
-           init_new calls don't double-accumulate penalties.
-
-        It does NOT pin into `batch_record_buf`: the sync path runs on a single
-        stream (no cross-stream tensor lifetime to protect) and
-        `batch_record_buf` is not allocated when overlap is off.
-        """
-        sched_snapshot = {
-            f.name: getattr(batch, f.name) for f in dataclasses.fields(batch)
-        }
-        sched_sampling_info = batch.sampling_info
-        if sched_sampling_info is not None:
-            batch.sampling_info = sched_sampling_info.copy_for_forward()
-        try:
-            yield
-        finally:
-            for name, value in sched_snapshot.items():
-                setattr(batch, name, value)
 
     def run_batch(
         self,
@@ -3058,7 +3033,7 @@ class Scheduler(
                     # post-forward must not un-consume staging.
                     resolve_forward_inputs(batch, self.future_map)
 
-                    with self._overlap_forward_isolation(batch):
+                    with self._forward_isolation(batch, pin=True):
                         future_indices = batch.req_pool_indices
 
                         # Spec_v2 fires on_publish mid-worker (between verify and
@@ -3122,7 +3097,7 @@ class Scheduler(
                 # future_map relay, no on_publish; next draft input installed
                 # directly as spec_info.
                 resolve_forward_inputs(batch, self.future_map)
-                with self._spec_v2_sync_forward_isolation(batch):
+                with self._forward_isolation(batch, pin=False):
                     batch_result = self.model_worker.forward_batch_generation(batch)
                 # Install after the isolation restore so it survives as the
                 # next-iter draft input.
