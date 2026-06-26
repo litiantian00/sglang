@@ -716,6 +716,29 @@ def post_reorder_triton_kernel(
 
 
 @triton.jit
+def _fwd_kernel_psum_to_m_indices(
+    psum,
+    m_indices,
+    BLOCK_E: tl.constexpr,
+    ALIGNMENT: tl.constexpr,
+):
+    cur_expert = tl.program_id(0)
+
+    cur_psum = tl.load(psum + cur_expert).to(tl.int64)
+    if cur_expert == 0:
+        start = tl.zeros([], dtype=tl.int64)
+    else:
+        prev_psum = tl.load(psum + cur_expert - 1).to(tl.int64)
+        start = ((prev_psum + ALIGNMENT - 1) // ALIGNMENT) * ALIGNMENT
+    count = cur_psum - start
+
+    off = tl.arange(0, BLOCK_E)
+    for s in tl.range(0, count, BLOCK_E, num_stages=4):
+        mask = (s + off) < count
+        tl.store(m_indices + start + s + off, cur_expert, mask=mask)
+
+
+@triton.jit
 def _fwd_kernel_ep_scatter_1(
     num_recv_tokens_per_expert,
     expert_start_loc,
@@ -827,6 +850,27 @@ def _fwd_kernel_ep_scatter_2(
                         to_copy_s,
                         mask=mask_s,
                     )
+
+
+@torch.no_grad()
+def psum_to_m_indices(
+    psum_gpu: torch.Tensor,
+    all_tokens: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Convert V2 expand psum to m_indices using a single fused triton kernel."""
+    num_experts = psum_gpu.shape[0]
+    m_indices = torch.zeros(all_tokens, dtype=torch.int32, device=device)
+    if num_experts == 0:
+        return m_indices
+    _fwd_kernel_psum_to_m_indices[(num_experts,)](
+        psum_gpu,
+        m_indices,
+        BLOCK_E=128,
+        ALIGNMENT=128,
+        num_warps=4,
+    )
+    return m_indices
 
 
 # copy from https://github.com/ModelTC/lightllm/blob/main/lightllm/common/fused_moe/deepep_scatter_gather.py

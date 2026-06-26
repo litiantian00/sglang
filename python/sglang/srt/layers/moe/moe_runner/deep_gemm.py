@@ -818,6 +818,52 @@ def post_permute_deep_gemm_to_deepep_normal(
     )
 
 
+@register_pre_permute("deepep_v2_expand", "deep_gemm")
+def pre_permute_deepep_v2_expand_to_deep_gemm(
+    dispatch_output: "DeepEPV2ExpandDispatchOutput",
+    quant_info: DeepGemmMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> DeepGemmRunnerInput:
+    """Zero-copy pre-permute for V2 expand dispatch output.
+
+    V2 dispatch (do_expand=True) already produces expert-sorted data.
+    We only need to generate m_indices from psum using a single fused triton kernel.
+    """
+    from sglang.srt.layers.moe.ep_moe.kernels import psum_to_m_indices
+
+    hidden_states, hidden_states_scale, psum_gpu, counts_list = dispatch_output
+
+    all_tokens = hidden_states.shape[0]
+
+    running_state["all_tokens"] = all_tokens
+    running_state["hidden_states_shape"] = hidden_states.shape
+    running_state["hidden_states_device"] = hidden_states.device
+    running_state["hidden_states_dtype"] = hidden_states.dtype
+
+    m_indices = psum_to_m_indices(psum_gpu, all_tokens, hidden_states.device)
+
+    return DeepGemmRunnerInput(
+        hidden_states=hidden_states,
+        hidden_states_scale=hidden_states_scale,
+        use_masked_gemm=False,
+        m_indices=m_indices,
+    )
+
+
+@register_post_permute("deep_gemm", "deepep_v2_expand")
+def post_permute_deep_gemm_to_deepep_v2_expand(
+    runner_output: DeepGemmRunnerOutput,
+    quant_info: DeepGemmMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> "DeepEPV2ExpandCombineInput":
+    """Zero-copy post-permute for V2 expand combine input."""
+    from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPV2ExpandCombineInput
+
+    return DeepEPV2ExpandCombineInput(hidden_states=runner_output.hidden_states)
+
+
 def _varlen_deep_gemm_silu_mul_quant(
     gateup_output: torch.Tensor,
     masked_m: Optional[torch.Tensor],

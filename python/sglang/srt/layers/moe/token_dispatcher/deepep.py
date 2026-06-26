@@ -55,6 +55,23 @@ try:
 except ImportError:
     use_deepep = False
 
+# DeepEP V2 introduces `ElasticBuffer` alongside the legacy `Buffer`
+#(deepseek-ai/DeepEP#605, merged 2026-04-29). On V2 both classes are
+# exported from `deep_ep.__init__`, so the existing `from deep_ep import
+# Buffer` surface above continues to work unchanged — `ElasticBuffer` is
+# an additional, MoE-shape ctor with auto-QP sizing that callers may
+# opt into. The probe below is orthogonal to `use_deepep` and does not
+# affect the default code path. V2 usage is further gated on
+# `SGLANG_DEEPEP_USE_V2=1`. Mirrors the `HAVE_DEEP_EP_V2` probe shape
+# already used in NVIDIA/Megatron-LM's `fused_a2a.py`.
+try:
+    from deep_ep import ElasticBuffer
+
+    have_deepep_v2 = True
+except ImportError:
+    ElasticBuffer = None
+    have_deepep_v2 = False
+
 from enum import Enum, IntEnum, auto
 
 import torch
@@ -141,6 +158,39 @@ assert isinstance(DeepEPNormalCombineInput, CombineInput)
 assert isinstance(DeepEPLLCombineInput, CombineInput)
 
 
+class DeepEPV2ExpandDispatchOutput(NamedTuple):
+    """V2 ElasticBuffer dispatch output for eager/prefill path (do_expand=True).
+
+    hidden_states is [num_expanded_tokens, H] — already expert-sorted by the V2
+    copy-epilogue kernel.  No Python-side format conversion needed.
+    """
+
+    hidden_states: torch.Tensor
+    hidden_states_scale: Optional[torch.Tensor]
+    psum_num_recv_tokens_per_expert: torch.Tensor
+    num_recv_tokens_per_expert_list: List[int]
+
+    @property
+    def format(self) -> DispatchOutputFormat:
+        return DispatchOutputFormat.DEEPEP_V2_EXPAND
+
+
+class DeepEPV2ExpandCombineInput(NamedTuple):
+    """V2 expand combine input — 2D expert-sorted, consumed directly by V2 combine."""
+
+    hidden_states: torch.Tensor
+    topk_ids: Optional[torch.Tensor] = None
+    topk_weights: Optional[torch.Tensor] = None
+
+    @property
+    def format(self) -> CombineInputFormat:
+        return CombineInputFormat.DEEPEP_V2_EXPAND
+
+
+assert isinstance(DeepEPV2ExpandDispatchOutput, DispatchOutput)
+assert isinstance(DeepEPV2ExpandCombineInput, CombineInput)
+
+
 class DeepEPDispatchMode(IntEnum):
     NORMAL = auto()
     LOW_LATENCY = auto()
@@ -162,6 +212,7 @@ class DeepEPBuffer:
         deepep_mode: DeepEPMode,
         num_max_dispatch_tokens_per_rank: int = -1,
         num_experts: int = -1,
+        num_topk: int = 0,
     ):
         if cls._buffer is not None:
             return cls._buffer
@@ -169,6 +220,17 @@ class DeepEPBuffer:
         cls._hidden_size = hidden_size
         cls._num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
         cls._num_experts = num_experts
+
+        if have_deepep_v2 and get_bool_env_var("SGLANG_DEEPEP_USE_V2", default="false"):
+            cls._buffer = cls._build_v2_buffer(
+                group,
+                hidden_size,
+                deepep_mode,
+                num_max_dispatch_tokens_per_rank,
+                num_experts,
+                num_topk,
+            )
+            return cls._buffer
 
         num_nvl_bytes, num_rdma_bytes = 0, 0
         if deepep_mode.enable_normal():
@@ -243,7 +305,51 @@ class DeepEPBuffer:
         return cls._buffer
 
     @classmethod
+    def _build_v2_buffer(
+        cls,
+        group: dist.ProcessGroup,
+        hidden_size: int,
+        deepep_mode: DeepEPMode,
+        num_max_dispatch_tokens_per_rank: int,
+        num_experts: int,
+        num_topk: int,
+    ):
+        if num_max_dispatch_tokens_per_rank <= 0:
+            num_max_dispatch_tokens_per_rank = (
+                envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+            )
+        if deepep_mode.enable_low_latency():
+            assert num_experts != -1 and num_experts % group.size() == 0
+
+        backend = get_moe_runner_backend()
+        need_bf16_dispatch = backend.is_cutlass() or (
+            backend.is_deep_gemm() and envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
+        )
+        use_fp8 = deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and not need_bf16_dispatch
+
+        logger.info(
+            "SGLANG_DEEPEP_USE_V2=1: constructing deep_ep.ElasticBuffer "
+            "(num_max_tokens_per_rank=%d, hidden=%d, num_topk=%d, use_fp8_dispatch=%s).",
+            num_max_dispatch_tokens_per_rank,
+            hidden_size,
+            num_topk,
+            use_fp8,
+        )
+        return ElasticBuffer(
+            group=group,
+            num_max_tokens_per_rank=num_max_dispatch_tokens_per_rank,
+            hidden=hidden_size,
+            num_topk=num_topk,
+            use_fp8_dispatch=use_fp8,
+        )
+
+    @classmethod
     def clean_buffer(cls):
+        # DeepEP V2's `ElasticBuffer` does not expose `low_latency_mode`
+        # or `clean_low_latency_buffer` — low-latency cleanup is handled
+        # internally via `EPHandle` lifetime. Fall through for V2.
+        if not hasattr(cls._buffer, "clean_low_latency_buffer"):
+            return
         if not cls._buffer.low_latency_mode:
             return
         cls._buffer.clean_low_latency_buffer(
@@ -335,7 +441,8 @@ class _DeepEPDispatcherImplBase:
         )
         # DeepEP internode_ll dispatch uses FINISHED_SUM_TAG=1024
         # and the logic requires num-tokens-sent-from-one-rank-to-another-rank less than it
-        assert self.num_max_dispatch_tokens_per_rank <= 1024
+        if not have_deepep_v2 and not get_bool_env_var("SGLANG_DEEPEP_USE_V2", default="false"):
+            assert self.num_max_dispatch_tokens_per_rank <= 1024
 
         self.handle = None
 
@@ -764,6 +871,473 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             self.num_experts,
         )
 
+def _align_up_val(value: int, alignment: int) -> int:
+    return ((value + alignment - 1) // alignment) * alignment
+
+
+def _psum_to_starts_counts(psum: torch.Tensor, alignment: int):
+    psum_i64 = psum.to(torch.int64)
+    psum_shifted = torch.zeros_like(psum_i64)
+    psum_shifted[1:] = psum_i64[:-1]
+    starts = (psum_shifted + alignment - 1) // alignment * alignment
+    counts = psum_i64 - starts
+    return starts, counts
+
+
+def _convert_v2_expand_to_v1(
+    recv_x: torch.Tensor,
+    recv_sf: Optional[torch.Tensor],
+    handle,
+    num_max_dispatch_tokens_per_rank: int,
+    num_ranks: int,
+    num_experts: int,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, List[int], List[int]]:
+    E_local = num_experts // num_ranks
+    T_max = num_max_dispatch_tokens_per_rank
+    R = num_ranks
+    H = recv_x.shape[-1]
+    alignment = handle.expert_alignment
+
+    counts_list = handle.num_recv_tokens_per_expert_list
+    starts_list = []
+    offset = 0
+    for e in range(E_local):
+        starts_list.append(offset)
+        offset += counts_list[e]
+        offset = _align_up_val(offset, alignment)
+
+    counts_tensor = torch.tensor(counts_list, dtype=torch.int32, device=recv_x.device)
+
+    packed_x = recv_x.new_empty((E_local, R * T_max, H))
+    for e in range(E_local):
+        c = counts_list[e]
+        s = starts_list[e]
+        if c > 0:
+            packed_x[e, :c, :].copy_(recv_x[s:s + c, :], non_blocking=True)
+        if c < R * T_max:
+            packed_x[e, c:, :].zero_()
+
+    packed_sf = None
+    if recv_sf is not None:
+        num_sf = recv_sf.shape[1]
+        packed_sf_raw = recv_sf.new_zeros((E_local, num_sf, R * T_max))
+        for e in range(E_local):
+            c = counts_list[e]
+            s = starts_list[e]
+            if c > 0:
+                packed_sf_raw[e, :, :c] = recv_sf[s:s + c, :].T
+        packed_sf = packed_sf_raw.permute(0, 2, 1)
+
+    return packed_x, packed_sf, counts_tensor, starts_list, counts_list
+
+
+def _convert_v2_nonexpand_to_v1(
+    recv_x: torch.Tensor,
+    recv_sf: Optional[torch.Tensor],
+    recv_topk_idx: torch.Tensor,
+    handle,
+    num_max_dispatch_tokens_per_rank: int,
+    num_ranks: int,
+    num_experts: int,
+    local_rank: int,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
+    E_local = num_experts // num_ranks
+    T_max = num_max_dispatch_tokens_per_rank
+    R = num_ranks
+    H = recv_x.shape[-1]
+    num_topk = recv_topk_idx.shape[1]
+    num_recv_tokens = handle.num_recv_tokens
+    local_expert_start = local_rank * E_local
+
+    valid_topk = recv_topk_idx[:num_recv_tokens]
+    token_indices = torch.arange(num_recv_tokens, device=recv_x.device, dtype=torch.int64).unsqueeze(1).expand(-1, num_topk).reshape(-1)
+    expert_global = valid_topk.reshape(-1)
+
+    valid_mask = (
+        (expert_global >= local_expert_start) &
+        (expert_global < local_expert_start + E_local) &
+        (expert_global >= 0)
+    )
+    valid_token_idx = token_indices[valid_mask]
+    valid_expert_local = (expert_global[valid_mask] - local_expert_start).to(torch.int32)
+
+    sort_key = valid_expert_local.to(torch.int64) * num_recv_tokens + valid_token_idx
+    sorted_indices = torch.argsort(sort_key)
+    valid_token_idx = valid_token_idx[sorted_indices]
+    valid_expert_local = valid_expert_local[sorted_indices]
+
+    expert_counts = torch.bincount(valid_expert_local, minlength=E_local).to(torch.int32)
+    expert_offsets = torch.zeros(E_local + 1, dtype=torch.int64, device=recv_x.device)
+    expert_offsets[1:] = torch.cumsum(expert_counts.to(torch.int64), dim=0)
+    global_prefix = torch.arange(len(valid_token_idx), dtype=torch.int64, device=recv_x.device)
+    slot_in_expert = global_prefix - expert_offsets[valid_expert_local.long()]
+
+    packed_x = torch.zeros((E_local, R * T_max, H), dtype=recv_x.dtype, device=recv_x.device)
+    packed_x[valid_expert_local.long(), slot_in_expert.long()] = recv_x[valid_token_idx.long()]
+
+    packed_sf = None
+    if recv_sf is not None:
+        num_sf = recv_sf.shape[1]
+        packed_sf_raw = torch.zeros((E_local, num_sf, R * T_max), dtype=recv_sf.dtype, device=recv_sf.device)
+        expanded_sf = recv_sf[valid_token_idx.long()]
+        for sf_ch in range(num_sf):
+            packed_sf_raw[valid_expert_local.long(), sf_ch, slot_in_expert.long()] = expanded_sf[:, sf_ch]
+        packed_sf = packed_sf_raw.permute(0, 2, 1)
+
+    return packed_x, packed_sf, expert_counts, valid_expert_local.long(), slot_in_expert.long(), valid_token_idx.long()
+
+
+def _convert_v2_dispatch_to_v1_ll_format(
+    recv_x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+    recv_topk_ids: Optional[torch.Tensor],
+    handle,
+    original_topk_ids: torch.Tensor,
+    original_topk_weights: torch.Tensor,
+    num_max_dispatch_tokens_per_rank: int,
+    num_ranks: int,
+    num_experts: int,
+    local_rank: int,
+    dispatch_ctx: dict,
+) -> "DeepEPLLDispatchOutput":
+    if isinstance(recv_x, tuple):
+        recv_data, recv_sf = recv_x
+    else:
+        recv_data, recv_sf = recv_x, None
+
+    cached_buffers = dispatch_ctx.get('_cached_buffers')
+    if cached_buffers is None:
+        cached_buffers = {}
+        dispatch_ctx['_cached_buffers'] = cached_buffers
+
+    if handle.do_expand:
+        packed_x, packed_sf, masked_m, starts_list, counts_list = _convert_v2_expand_to_v1(
+            recv_data, recv_sf, handle,
+            num_max_dispatch_tokens_per_rank, num_ranks, num_experts,
+        )
+        dispatch_ctx['starts_list'] = starts_list
+        dispatch_ctx['counts_list'] = counts_list
+        dispatch_ctx['recv_x_shape'] = recv_data.shape
+    else:
+        packed_x, packed_sf, masked_m, valid_expert_local, slot_in_expert, valid_token_idx = _convert_v2_nonexpand_to_v1(
+            recv_data, recv_sf, recv_topk_ids, handle,
+            num_max_dispatch_tokens_per_rank, num_ranks, num_experts, local_rank,
+        )
+        dispatch_ctx['recv_x_shape'] = recv_data.shape
+        dispatch_ctx['valid_expert_local'] = valid_expert_local
+        dispatch_ctx['slot_in_expert'] = slot_in_expert
+        dispatch_ctx['valid_token_idx'] = valid_token_idx
+
+    num_tokens = original_topk_ids.shape[0]
+    num_topk = original_topk_ids.shape[1]
+    expected_m = (num_tokens * num_ranks * num_topk + num_experts) // num_experts
+
+    return DeepEPLLDispatchOutput(
+        hidden_states=packed_x,
+        hidden_states_scale=packed_sf,
+        topk_ids=original_topk_ids,
+        topk_weights=original_topk_weights,
+        masked_m=masked_m,
+        expected_m=expected_m,
+    )
+
+
+def _reverse_scatter_3d_to_v2_flat(
+    hidden_states_3d: torch.Tensor,
+    dispatch_ctx: dict,
+    handle,
+) -> torch.Tensor:
+    if handle.do_expand:
+        starts_list = dispatch_ctx['starts_list']
+        counts_list = dispatch_ctx['counts_list']
+        recv_x_shape = dispatch_ctx['recv_x_shape']
+        E_local = hidden_states_3d.shape[0]
+        H = hidden_states_3d.shape[2]
+
+        flat = hidden_states_3d.new_zeros((recv_x_shape[0], H))
+        for e in range(E_local):
+            c = counts_list[e]
+            s = starts_list[e]
+            if c > 0:
+                flat[s:s + c, :].copy_(hidden_states_3d[e, :c, :], non_blocking=True)
+        return flat
+    else:
+        recv_x_shape = dispatch_ctx['recv_x_shape']
+        valid_expert_local = dispatch_ctx['valid_expert_local']
+        slot_in_expert = dispatch_ctx['slot_in_expert']
+        valid_token_idx = dispatch_ctx['valid_token_idx']
+        H = hidden_states_3d.shape[2]
+        num_recv_tokens = recv_x_shape[0]
+
+        gathered = hidden_states_3d[valid_expert_local, slot_in_expert]
+        flat = torch.zeros(num_recv_tokens, H, dtype=hidden_states_3d.dtype, device=hidden_states_3d.device)
+        flat.scatter_add_(0, valid_token_idx.unsqueeze(1).expand(-1, H), gathered)
+        return flat
+
+
+class _DeepEPDispatcherImplV2(_DeepEPDispatcherImplBase):
+    """DeepEP V2 (ElasticBuffer) dispatcher implementation.
+    """
+
+    def __init__(self, async_finish: bool, **kwargs):
+        super().__init__(**kwargs)
+        self.async_finish = async_finish
+        self.quant_config = {}
+        self.num_comm_sms = 0
+        # do_expand controls whether ElasticBuffer performs C++ side expert-sort
+        # (expand) during dispatch. Controlled by env SGLANG_DEEPEP_V2_DO_EXPAND.
+        self.do_expand = get_bool_env_var("SGLANG_DEEPEP_V2_DO_EXPAND", default="true")
+        self._dispatch_ctx = {}
+
+    def dispatch_a(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+    ):
+        """Phase 1 of dispatch: quantize hidden_states and deduplicate topk_ids.
+
+        Deduplication: if a token is routed to the same expert multiple times
+        (duplicate entries in topk_ids), only the first occurrence is kept;
+        later duplicates are masked to -1 with weight 0.
+        """
+        topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
+        topk_ids = topk_ids.to(torch.int64)
+
+        num_topk = topk_ids.shape[1]
+        if num_topk > 1:
+            pair_eq = (topk_ids.unsqueeze(2) == topk_ids.unsqueeze(1))
+            is_later_dup = pair_eq.triu(diagonal=1).any(dim=2)
+            topk_ids = topk_ids.masked_fill(is_later_dup, -1)
+            topk_weights = topk_weights.masked_fill(is_later_dup, 0.0)
+
+        backend = get_moe_runner_backend()
+        need_bf16_dispatch = backend.is_cutlass() or (
+            backend.is_deep_gemm() and envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
+        )
+        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and not need_bf16_dispatch:
+            hidden_states = sglang_per_token_group_quant_fp8(
+                hidden_states,
+                128,
+                column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            )
+
+        previous_event = ElasticBuffer.capture() if self.async_finish else None
+        return hidden_states, topk_ids, topk_weights, previous_event
+
+    def dispatch_b(self, hidden_states, topk_ids, topk_weights, previous_event):
+        """Phase 2 of dispatch: all-to-all communication and output formatting.
+
+        Three possible return paths:
+        - is_capturing=True: placeholder DeepEPLLDispatchOutput for CUDA Graph capture
+        - use_expand_now=True: DeepEPV2ExpandDispatchOutput for prefill (zero-copy, contiguous GEMM)
+        - otherwise: DeepEPLLDispatchOutput via format conversion (decode warmup, masked GEMM)
+        """
+        original_topk_ids = topk_ids
+        original_topk_weights = topk_weights
+        is_capturing = torch.cuda.is_current_stream_capturing()
+        is_extend = get_is_extend_in_batch()
+        # Prefill/extend uses the optimized V2 expand path: do_expand=True in buffer.dispatch
+        # produces expert-sorted data directly, avoiding Python-side format conversion.
+        # Decode uses do_expand=False to stay compatible with masked GEMM / CUDA Graph.
+        use_expand_now = self.do_expand and is_extend and not is_capturing
+
+        (
+            recv_x,
+            recv_topk_ids,
+            recv_topk_weights,
+            event,
+        ) = self._dispatch_core(hidden_states, topk_ids, topk_weights, previous_event,
+                                is_capturing=is_capturing,
+                                use_expand=use_expand_now)
+        event.current_stream_wait() if self.async_finish else ()
+
+        if isinstance(recv_x, tuple):
+            recv_hidden, recv_sf = recv_x
+        else:
+            recv_hidden, recv_sf = recv_x, None
+
+        if is_capturing:
+            # CUDA Graph capture path: construct a placeholder DeepEPLLDispatchOutput
+            # with masked_m=0 so the masked GEMM kernel is recorded but does not
+            # compute real tokens. Replay will update masked_m with actual values.
+            E_local = self.num_local_experts
+            R = self.group.size()
+            T_max = self.num_max_dispatch_tokens_per_rank
+            N = recv_hidden.shape[0]
+            H = recv_hidden.shape[-1]
+            M = max(N // E_local, 1) if E_local > 0 else R * T_max
+            packed_x = recv_hidden[:E_local * M].view(E_local, M, H)
+            packed_sf = recv_sf[:E_local * M].view(E_local, M, recv_sf.shape[-1]) if recv_sf is not None else None
+            masked_m = torch.zeros(E_local, dtype=torch.int32, device=recv_hidden.device)
+            num_topk = original_topk_ids.shape[1]
+            expected_m = (original_topk_ids.shape[0] * R * num_topk + self.num_experts) // self.num_experts
+            self._dispatch_ctx = {'capture_mode': True}
+            return DeepEPLLDispatchOutput(
+                hidden_states=packed_x,
+                hidden_states_scale=packed_sf,
+                topk_ids=original_topk_ids,
+                topk_weights=original_topk_weights,
+                masked_m=masked_m,
+                expected_m=expected_m,
+            )
+
+        if use_expand_now:
+            # Prefill/extend optimized path: V2 C++ expand kernel already produced
+            # expert-sorted flat data. Return DeepEPV2ExpandDispatchOutput which
+            # downstream feeds into psum_to_m_indices (1 triton kernel) → contiguous
+            # GEMM. No Python format conversion, no data copy, no padding waste.
+            self._dispatch_ctx = {}
+            return DeepEPV2ExpandDispatchOutput(
+                hidden_states=recv_hidden,
+                hidden_states_scale=recv_sf,
+                psum_num_recv_tokens_per_expert=self.handle.psum_num_recv_tokens_per_expert,
+                num_recv_tokens_per_expert_list=self.handle.num_recv_tokens_per_expert_list,
+            )
+
+        # Decode non-capture path (warmup or eager without CUDA Graph):
+        # Convert V2 dispatch output to V1 LL format [E, R*T_max, H] + masked_m,
+        # so the same masked GEMM kernel shape is used as in CUDA Graph capture.
+        self._dispatch_ctx = {}
+        return _convert_v2_dispatch_to_v1_ll_format(
+            recv_x=recv_x,
+            recv_topk_ids=recv_topk_ids,
+            handle=self.handle,
+            original_topk_ids=original_topk_ids,
+            original_topk_weights=original_topk_weights,
+            num_max_dispatch_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
+            num_ranks=self.group.size(),
+            num_experts=self.num_experts,
+            local_rank=self.group.rank(),
+            dispatch_ctx=self._dispatch_ctx,
+        )
+
+    def _dispatch_core(
+        self,
+        x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        previous_event,
+        is_capturing: bool = False,
+        use_expand: bool = False,
+    ):
+        """Execute the ElasticBuffer all-to-all dispatch communication.
+
+        Args:
+            use_expand: if True, V2 C++ kernel sorts tokens by expert in-place
+                (zero-copy expand). The resulting recv_x is already expert-sorted.
+            is_capturing: if True, we are inside CUDA Graph capture_begin/end.
+
+        do_expand and do_cpu_sync logic:
+            - use_expand=True (prefill): do_expand=True, do_cpu_sync=False
+              (GPU psum tensor is sufficient; no CPU sync needed)
+            - use_expand=False, is_capturing=True (capture): do_expand=False, do_cpu_sync=False
+              (placeholder path, no real data needed on CPU)
+            - use_expand=False, is_capturing=False (decode warmup): do_expand=False, do_cpu_sync=True
+              (_convert_v2_nonexpand_to_v1 needs handle.num_recv_tokens from CPU sync)
+        """
+        buffer = self._get_buffer()
+        _deepep_precompile_tp_barrier()
+
+        (
+            recv_x,
+            recv_topk_ids,
+            recv_topk_weights,
+            self.handle,
+            event,
+        ) = buffer.dispatch(
+            x,
+            topk_idx=topk_ids,
+            topk_weights=topk_weights,
+            num_experts=self.num_experts,
+            num_max_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
+            expert_alignment=128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1,
+            num_sms=self.num_comm_sms,
+            previous_event=previous_event,
+            async_with_compute_stream=self.async_finish,
+            allocate_on_comm_stream=(previous_event is not None) and self.async_finish,
+            do_expand=use_expand,
+            do_cpu_sync=not is_capturing and not use_expand,
+            use_tma_aligned_col_major_sf=(
+                deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL
+            ),
+        )
+
+        return (
+            recv_x,
+            recv_topk_ids,
+            recv_topk_weights,
+            event,
+        )
+
+    def combine_a(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ):
+        """Phase 1 of combine: prepare GEMM output for V2 combine communication.
+
+        Three cases based on output dimensionality:
+        - 2D tensor: V2 expand path output, already flat expert-sorted → pass through
+        - 3D tensor + capture_mode: CUDA Graph path [E, M, H] → simple reshape to 2D
+        - 3D tensor + normal: decode warmup path [E, M, H] → reverse scatter to flat
+        """
+        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter or _is_npu:
+            output = hidden_states
+        else:
+            raise NotImplementedError()
+
+        if output.dim() == 3:
+            if getattr(self, '_dispatch_ctx', {}).get('capture_mode', False):
+                # CUDA Graph capture/replay: packed [E, M, H] → flat [E*M, H]
+                E, M, H = output.shape
+                output = output.reshape(E * M, H)
+            else:
+                # Decode warmup: reverse the scatter done in _convert_v2_dispatch_to_v1_ll_format
+                output = _reverse_scatter_3d_to_v2_flat(output, self._dispatch_ctx, self.handle)
+
+        previous_event = ElasticBuffer.capture() if self.async_finish else None
+        return output, previous_event
+
+    def combine_b(self, output, previous_event):
+        """Phase 2 of combine: execute V2 ElasticBuffer combine communication."""
+        hidden_states, event = self._combine_core(output, previous_event)
+        event.current_stream_wait() if self.async_finish else ()
+        self.handle = None
+        self._dispatch_ctx = {}
+        return hidden_states
+
+    def _combine_core(self, x: torch.Tensor, previous_event):
+        buffer = self._get_buffer()
+        _deepep_precompile_tp_barrier()
+
+        combined_x, _, event = buffer.combine(
+            x,
+            self.handle,
+            num_sms=self.num_comm_sms,
+            previous_event=previous_event,
+            async_with_compute_stream=self.async_finish,
+            allocate_on_comm_stream=previous_event is not None,
+        )
+        return combined_x, event
+
+    def _get_buffer(self):
+        buffer = DeepEPBuffer.get_deepep_buffer(
+            self.group,
+            self.hidden_size,
+            self.params_bytes,
+            self.deepep_mode,
+            self.num_max_dispatch_tokens_per_rank,
+            self.num_experts,
+            num_topk=self.router_topk,
+        )
+        if self.num_comm_sms == 0:
+            self.num_comm_sms = buffer.get_theoretical_num_sms(
+                self.num_experts, self.router_topk
+            )
+        return buffer
 
 @dataclass
 class _Stage(Enum):
@@ -774,6 +1348,10 @@ class _Stage(Enum):
 
 
 class DeepEPDispatcher(BaseDispatcher):
+    @property
+    def _is_v2(self) -> bool:
+        return have_deepep_v2 and get_bool_env_var("SGLANG_DEEPEP_USE_V2", default="false")
+
     def __init__(
         self,
         group: torch.distributed.ProcessGroup,
@@ -802,16 +1380,23 @@ class DeepEPDispatcher(BaseDispatcher):
             deepep_mode=deepep_mode,
         )
 
-        if self.deepep_mode.enable_low_latency():
-            self._low_latency_dispatcher = _DeepEPDispatcherImplLowLatency(
-                return_recv_hook=return_recv_hook,
+        if self._is_v2:
+            self._normal_dispatcher = _DeepEPDispatcherImplV2(
+                # async_finish=async_finish,
+                async_finish=False,
                 **common_kwargs,
             )
-        if self.deepep_mode.enable_normal():
-            self._normal_dispatcher = _DeepEPDispatcherImplNormal(
-                async_finish=async_finish,
-                **common_kwargs,
-            )
+        else:
+            if self.deepep_mode.enable_low_latency():
+                self._low_latency_dispatcher = _DeepEPDispatcherImplLowLatency(
+                    return_recv_hook=return_recv_hook,
+                    **common_kwargs,
+                )
+            if self.deepep_mode.enable_normal():
+                self._normal_dispatcher = _DeepEPDispatcherImplNormal(
+                    async_finish=async_finish,
+                    **common_kwargs,
+                )
 
         self._stage = _Stage.INITIAL
         self._deepep_dispatch_hooks = DeepEPPDispatchHooks()
@@ -873,6 +1458,8 @@ class DeepEPDispatcher(BaseDispatcher):
         return self._get_impl().combine_b(*inner_state)
 
     def _get_impl(self) -> _DeepEPDispatcherImplBase:
+        if self._is_v2:
+            return self._normal_dispatcher
         is_extend_in_batch = get_is_extend_in_batch()
         resolved_deepep_mode = self.deepep_mode.resolve(is_extend_in_batch)
         if resolved_deepep_mode == DeepEPMode.NORMAL:
@@ -888,6 +1475,9 @@ class DeepEPDispatcher(BaseDispatcher):
 
     def set_quant_config(self, quant_config: dict):
         super().set_quant_config(quant_config)
+        if self._is_v2:
+            self._normal_dispatcher.set_quant_config(quant_config)
+            return
         if self.deepep_mode.enable_low_latency():
             self._low_latency_dispatcher.set_quant_config(quant_config)
         if self.deepep_mode.enable_normal():
@@ -897,6 +1487,11 @@ class DeepEPDispatcher(BaseDispatcher):
         self, combine_overlap_args: CombineOverlapArgs, meta_overlap_args: dict
     ):
         super().set_overlap_args(combine_overlap_args, meta_overlap_args)
+        if self._is_v2:
+            self._normal_dispatcher.set_overlap_args(
+                combine_overlap_args, meta_overlap_args
+            )
+            return
         if self.deepep_mode.enable_low_latency():
             self._low_latency_dispatcher.set_overlap_args(
                 combine_overlap_args, meta_overlap_args
@@ -908,6 +1503,9 @@ class DeepEPDispatcher(BaseDispatcher):
 
     def clear_overlap_args(self):
         super().clear_overlap_args()
+        if self._is_v2:
+            self._normal_dispatcher.clear_overlap_args()
+            return
         if self.deepep_mode.enable_low_latency():
             self._low_latency_dispatcher.clear_overlap_args()
         if self.deepep_mode.enable_normal():
