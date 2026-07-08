@@ -191,6 +191,30 @@ assert isinstance(DeepEPV2ExpandDispatchOutput, DispatchOutput)
 assert isinstance(DeepEPV2ExpandCombineInput, CombineInput)
 
 
+class DeepEPV2NormalDispatchOutput(NamedTuple):
+    """V2 ElasticBuffer dispatch output for prefill (do_expand=False).
+
+    Same layout as DeepEPNormalDispatchOutput but uses a GPU psum tensor
+    instead of a CPU list, avoiding do_cpu_sync overhead.
+    num_total_alloc is the worst-case allocation size from dispatch,
+    needed by combine to match the expected tensor size.
+    """
+
+    hidden_states: torch.Tensor
+    hidden_states_scale: Optional[torch.Tensor]
+    topk_ids: torch.Tensor
+    topk_weights: torch.Tensor
+    psum_num_recv_tokens_per_expert: torch.Tensor
+    num_total_alloc: int
+
+    @property
+    def format(self) -> DispatchOutputFormat:
+        return DispatchOutputFormat.DEEPEP_V2_NORMAL
+
+
+assert isinstance(DeepEPV2NormalDispatchOutput, DispatchOutput)
+
+
 class DeepEPDispatchMode(IntEnum):
     NORMAL = auto()
     LOW_LATENCY = auto()
@@ -1093,11 +1117,11 @@ class _DeepEPDispatcherImplV2(_DeepEPDispatcherImplBase):
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
     ):
-        """Phase 1 of dispatch: quantize hidden_states and deduplicate topk_ids.
+        """Phase 1 of dispatch: quantize, deduplicate, and issue async communication.
 
-        Deduplication: if a token is routed to the same expert multiple times
-        (duplicate entries in topk_ids), only the first occurrence is kept;
-        later duplicates are masked to -1 with weight 0.
+        The all-to-all dispatch communication is issued here (on comm_stream)
+        so that it can overlap with shared expert computation in the
+        _deepep_dispatch_hook that runs between dispatch_a and dispatch_b.
         """
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
         topk_ids = topk_ids.to(torch.int64)
@@ -1122,34 +1146,36 @@ class _DeepEPDispatcherImplV2(_DeepEPDispatcherImplBase):
                 scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
             )
 
-        previous_event = ElasticBuffer.capture() if self.async_finish else None
-        return hidden_states, topk_ids, topk_weights, previous_event
-
-    def dispatch_b(self, hidden_states, topk_ids, topk_weights, previous_event):
-        """Phase 2 of dispatch: all-to-all communication and output formatting.
-
-        Three possible return paths:
-        - is_capturing=True: placeholder DeepEPLLDispatchOutput for CUDA Graph capture
-        - use_expand_now=True: DeepEPV2ExpandDispatchOutput for prefill (zero-copy, contiguous GEMM)
-        - otherwise: DeepEPLLDispatchOutput via format conversion (decode warmup, masked GEMM)
-        """
-        original_topk_ids = topk_ids
-        original_topk_weights = topk_weights
-        is_capturing = torch.cuda.is_current_stream_capturing()
         is_extend = get_is_extend_in_batch()
-        # Prefill/extend uses the optimized V2 expand path: do_expand=True in buffer.dispatch
-        # produces expert-sorted data directly, avoiding Python-side format conversion.
-        # Decode uses do_expand=False to stay compatible with masked GEMM / CUDA Graph.
-        use_expand_now = self.do_expand and is_extend and not is_capturing
 
-        (
-            recv_x,
-            recv_topk_ids,
-            recv_topk_weights,
-            event,
-        ) = self._dispatch_core(hidden_states, topk_ids, topk_weights, previous_event,
-                                is_capturing=is_capturing,
-                                use_expand=use_expand_now)
+        E_local = self.num_local_experts
+        R = self.group.size()
+        T_max = self.num_max_dispatch_tokens_per_rank
+        num_topk = topk_ids.shape[1]
+        alignment = 128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1
+
+        if is_extend:
+            do_expand = True
+            expert_alignment = alignment
+        else:
+            expected_m = (topk_ids.shape[0] * R * num_topk + self.num_experts) // self.num_experts
+            do_expand = True
+            expert_alignment = _align_up_val(min(R * T_max, expected_m * 8), 256)
+            expert_alignment = max(expert_alignment, 256)
+
+        previous_event = ElasticBuffer.capture() if self.async_finish else None
+        recv_x, recv_topk_ids, recv_topk_weights, event = self._dispatch_core(
+            hidden_states, topk_ids, topk_weights, previous_event,
+            do_expand=do_expand,
+            expert_alignment=expert_alignment,
+        )
+
+        return (topk_ids, topk_weights, is_extend, expert_alignment,
+                recv_x, recv_topk_ids, recv_topk_weights, event)
+
+    def dispatch_b(self, topk_ids, topk_weights, is_extend, expert_alignment,
+                   recv_x, recv_topk_ids, recv_topk_weights, event):
+        """Phase 2 of dispatch: wait for communication and format output."""
         event.current_stream_wait() if self.async_finish else ()
 
         if isinstance(recv_x, tuple):
@@ -1157,36 +1183,7 @@ class _DeepEPDispatcherImplV2(_DeepEPDispatcherImplBase):
         else:
             recv_hidden, recv_sf = recv_x, None
 
-        if is_capturing:
-            # CUDA Graph capture path: construct a placeholder DeepEPLLDispatchOutput
-            # with masked_m=0 so the masked GEMM kernel is recorded but does not
-            # compute real tokens. Replay will update masked_m with actual values.
-            E_local = self.num_local_experts
-            R = self.group.size()
-            T_max = self.num_max_dispatch_tokens_per_rank
-            N = recv_hidden.shape[0]
-            H = recv_hidden.shape[-1]
-            M = max(N // E_local, 1) if E_local > 0 else R * T_max
-            packed_x = recv_hidden[:E_local * M].view(E_local, M, H)
-            packed_sf = recv_sf[:E_local * M].view(E_local, M, recv_sf.shape[-1]) if recv_sf is not None else None
-            masked_m = torch.zeros(E_local, dtype=torch.int32, device=recv_hidden.device)
-            num_topk = original_topk_ids.shape[1]
-            expected_m = (original_topk_ids.shape[0] * R * num_topk + self.num_experts) // self.num_experts
-            self._dispatch_ctx = {'capture_mode': True}
-            return DeepEPLLDispatchOutput(
-                hidden_states=packed_x,
-                hidden_states_scale=packed_sf,
-                topk_ids=original_topk_ids,
-                topk_weights=original_topk_weights,
-                masked_m=masked_m,
-                expected_m=expected_m,
-            )
-
-        if use_expand_now:
-            # Prefill/extend optimized path: V2 C++ expand kernel already produced
-            # expert-sorted flat data. Return DeepEPV2ExpandDispatchOutput which
-            # downstream feeds into psum_to_m_indices (1 triton kernel) → contiguous
-            # GEMM. No Python format conversion, no data copy, no padding waste.
+        if is_extend:
             self._dispatch_ctx = {}
             return DeepEPV2ExpandDispatchOutput(
                 hidden_states=recv_hidden,
@@ -1195,21 +1192,36 @@ class _DeepEPDispatcherImplV2(_DeepEPDispatcherImplBase):
                 num_recv_tokens_per_expert_list=self.handle.num_recv_tokens_per_expert_list,
             )
 
-        # Decode non-capture path (warmup or eager without CUDA Graph):
-        # Convert V2 dispatch output to V1 LL format [E, R*T_max, H] + masked_m,
-        # so the same masked GEMM kernel shape is used as in CUDA Graph capture.
+        E_local = self.num_local_experts
+        R = self.group.size()
+        num_topk = topk_ids.shape[1]
+        max_m = expert_alignment
+
+        H = recv_hidden.shape[-1]
+        total_slots = E_local * max_m
+        slab_3d = recv_hidden[:total_slots].view(E_local, max_m, H)
+        slab_sf_3d = None
+        if recv_sf is not None:
+            sf_dim = recv_sf.shape[-1]
+            slab_sf_3d = recv_sf[:total_slots].view(E_local, max_m, sf_dim)
+
+        psum = self.handle.psum_num_recv_tokens_per_expert
+        masked_m = torch.empty(E_local, dtype=torch.int32, device=psum.device)
+        masked_m[0] = psum[0]
+        if E_local > 1:
+            psum_aligned_prev = ((psum[:-1] + max_m - 1) // max_m) * max_m
+            masked_m[1:] = psum[1:] - psum_aligned_prev
+
+        expected_m = (topk_ids.shape[0] * R * num_topk + self.num_experts) // self.num_experts
         self._dispatch_ctx = {}
-        return _convert_v2_dispatch_to_v1_ll_format(
-            recv_x=recv_x,
-            recv_topk_ids=recv_topk_ids,
-            handle=self.handle,
-            original_topk_ids=original_topk_ids,
-            original_topk_weights=original_topk_weights,
-            num_max_dispatch_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
-            num_ranks=self.group.size(),
-            num_experts=self.num_experts,
-            local_rank=self.group.rank(),
-            dispatch_ctx=self._dispatch_ctx,
+
+        return DeepEPLLDispatchOutput(
+            hidden_states=slab_3d,
+            hidden_states_scale=slab_sf_3d,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            masked_m=masked_m,
+            expected_m=expected_m,
         )
 
     def _dispatch_core(
@@ -1218,26 +1230,15 @@ class _DeepEPDispatcherImplV2(_DeepEPDispatcherImplBase):
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
         previous_event,
-        is_capturing: bool = False,
-        use_expand: bool = False,
+        do_expand: bool = True,
+        expert_alignment: Optional[int] = None,
     ):
-        """Execute the ElasticBuffer all-to-all dispatch communication.
-
-        Args:
-            use_expand: if True, V2 C++ kernel sorts tokens by expert in-place
-                (zero-copy expand). The resulting recv_x is already expert-sorted.
-            is_capturing: if True, we are inside CUDA Graph capture_begin/end.
-
-        do_expand and do_cpu_sync logic:
-            - use_expand=True (prefill): do_expand=True, do_cpu_sync=False
-              (GPU psum tensor is sufficient; no CPU sync needed)
-            - use_expand=False, is_capturing=True (capture): do_expand=False, do_cpu_sync=False
-              (placeholder path, no real data needed on CPU)
-            - use_expand=False, is_capturing=False (decode warmup): do_expand=False, do_cpu_sync=True
-              (_convert_v2_nonexpand_to_v1 needs handle.num_recv_tokens from CPU sync)
-        """
+        """Execute the ElasticBuffer all-to-all dispatch communication."""
         buffer = self._get_buffer()
         _deepep_precompile_tp_barrier()
+
+        if expert_alignment is None:
+            expert_alignment = 128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1
 
         (
             recv_x,
@@ -1251,13 +1252,13 @@ class _DeepEPDispatcherImplV2(_DeepEPDispatcherImplBase):
             topk_weights=topk_weights,
             num_experts=self.num_experts,
             num_max_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
-            expert_alignment=128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1,
+            expert_alignment=expert_alignment,
             num_sms=self.num_comm_sms,
             previous_event=previous_event,
             async_with_compute_stream=self.async_finish,
             allocate_on_comm_stream=(previous_event is not None) and self.async_finish,
-            do_expand=use_expand,
-            do_cpu_sync=not is_capturing and not use_expand,
+            do_expand=do_expand,
+            do_cpu_sync=False,
             use_tma_aligned_col_major_sf=(
                 deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
                 and deep_gemm_wrapper.DEEPGEMM_BLACKWELL
@@ -1277,26 +1278,14 @@ class _DeepEPDispatcherImplV2(_DeepEPDispatcherImplBase):
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
-        """Phase 1 of combine: prepare GEMM output for V2 combine communication.
-
-        Three cases based on output dimensionality:
-        - 2D tensor: V2 expand path output, already flat expert-sorted → pass through
-        - 3D tensor + capture_mode: CUDA Graph path [E, M, H] → simple reshape to 2D
-        - 3D tensor + normal: decode warmup path [E, M, H] → reverse scatter to flat
-        """
+        """Phase 1 of combine: prepare GEMM output and capture event."""
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter or _is_npu:
             output = hidden_states
         else:
             raise NotImplementedError()
 
         if output.dim() == 3:
-            if getattr(self, '_dispatch_ctx', {}).get('capture_mode', False):
-                # CUDA Graph capture/replay: packed [E, M, H] → flat [E*M, H]
-                E, M, H = output.shape
-                output = output.reshape(E * M, H)
-            else:
-                # Decode warmup: reverse the scatter done in _convert_v2_dispatch_to_v1_ll_format
-                output = _reverse_scatter_3d_to_v2_flat(output, self._dispatch_ctx, self.handle)
+            output = output.view(-1, output.shape[-1])
 
         previous_event = ElasticBuffer.capture() if self.async_finish else None
         return output, previous_event
@@ -1382,8 +1371,7 @@ class DeepEPDispatcher(BaseDispatcher):
 
         if self._is_v2:
             self._normal_dispatcher = _DeepEPDispatcherImplV2(
-                # async_finish=async_finish,
-                async_finish=False,
+                async_finish=async_finish,
                 **common_kwargs,
             )
         else:
