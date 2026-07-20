@@ -895,209 +895,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             self.num_experts,
         )
 
-def _align_up_val(value: int, alignment: int) -> int:
-    return ((value + alignment - 1) // alignment) * alignment
-
-
-def _psum_to_starts_counts(psum: torch.Tensor, alignment: int):
-    psum_i64 = psum.to(torch.int64)
-    psum_shifted = torch.zeros_like(psum_i64)
-    psum_shifted[1:] = psum_i64[:-1]
-    starts = (psum_shifted + alignment - 1) // alignment * alignment
-    counts = psum_i64 - starts
-    return starts, counts
-
-
-def _convert_v2_expand_to_v1(
-    recv_x: torch.Tensor,
-    recv_sf: Optional[torch.Tensor],
-    handle,
-    num_max_dispatch_tokens_per_rank: int,
-    num_ranks: int,
-    num_experts: int,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, List[int], List[int]]:
-    E_local = num_experts // num_ranks
-    T_max = num_max_dispatch_tokens_per_rank
-    R = num_ranks
-    H = recv_x.shape[-1]
-    alignment = handle.expert_alignment
-
-    counts_list = handle.num_recv_tokens_per_expert_list
-    starts_list = []
-    offset = 0
-    for e in range(E_local):
-        starts_list.append(offset)
-        offset += counts_list[e]
-        offset = _align_up_val(offset, alignment)
-
-    counts_tensor = torch.tensor(counts_list, dtype=torch.int32, device=recv_x.device)
-
-    packed_x = recv_x.new_empty((E_local, R * T_max, H))
-    for e in range(E_local):
-        c = counts_list[e]
-        s = starts_list[e]
-        if c > 0:
-            packed_x[e, :c, :].copy_(recv_x[s:s + c, :], non_blocking=True)
-        if c < R * T_max:
-            packed_x[e, c:, :].zero_()
-
-    packed_sf = None
-    if recv_sf is not None:
-        num_sf = recv_sf.shape[1]
-        packed_sf_raw = recv_sf.new_zeros((E_local, num_sf, R * T_max))
-        for e in range(E_local):
-            c = counts_list[e]
-            s = starts_list[e]
-            if c > 0:
-                packed_sf_raw[e, :, :c] = recv_sf[s:s + c, :].T
-        packed_sf = packed_sf_raw.permute(0, 2, 1)
-
-    return packed_x, packed_sf, counts_tensor, starts_list, counts_list
-
-
-def _convert_v2_nonexpand_to_v1(
-    recv_x: torch.Tensor,
-    recv_sf: Optional[torch.Tensor],
-    recv_topk_idx: torch.Tensor,
-    handle,
-    num_max_dispatch_tokens_per_rank: int,
-    num_ranks: int,
-    num_experts: int,
-    local_rank: int,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
-    E_local = num_experts // num_ranks
-    T_max = num_max_dispatch_tokens_per_rank
-    R = num_ranks
-    H = recv_x.shape[-1]
-    num_topk = recv_topk_idx.shape[1]
-    num_recv_tokens = handle.num_recv_tokens
-    local_expert_start = local_rank * E_local
-
-    valid_topk = recv_topk_idx[:num_recv_tokens]
-    token_indices = torch.arange(num_recv_tokens, device=recv_x.device, dtype=torch.int64).unsqueeze(1).expand(-1, num_topk).reshape(-1)
-    expert_global = valid_topk.reshape(-1)
-
-    valid_mask = (
-        (expert_global >= local_expert_start) &
-        (expert_global < local_expert_start + E_local) &
-        (expert_global >= 0)
-    )
-    valid_token_idx = token_indices[valid_mask]
-    valid_expert_local = (expert_global[valid_mask] - local_expert_start).to(torch.int32)
-
-    sort_key = valid_expert_local.to(torch.int64) * num_recv_tokens + valid_token_idx
-    sorted_indices = torch.argsort(sort_key)
-    valid_token_idx = valid_token_idx[sorted_indices]
-    valid_expert_local = valid_expert_local[sorted_indices]
-
-    expert_counts = torch.bincount(valid_expert_local, minlength=E_local).to(torch.int32)
-    expert_offsets = torch.zeros(E_local + 1, dtype=torch.int64, device=recv_x.device)
-    expert_offsets[1:] = torch.cumsum(expert_counts.to(torch.int64), dim=0)
-    global_prefix = torch.arange(len(valid_token_idx), dtype=torch.int64, device=recv_x.device)
-    slot_in_expert = global_prefix - expert_offsets[valid_expert_local.long()]
-
-    packed_x = torch.zeros((E_local, R * T_max, H), dtype=recv_x.dtype, device=recv_x.device)
-    packed_x[valid_expert_local.long(), slot_in_expert.long()] = recv_x[valid_token_idx.long()]
-
-    packed_sf = None
-    if recv_sf is not None:
-        num_sf = recv_sf.shape[1]
-        packed_sf_raw = torch.zeros((E_local, num_sf, R * T_max), dtype=recv_sf.dtype, device=recv_sf.device)
-        expanded_sf = recv_sf[valid_token_idx.long()]
-        for sf_ch in range(num_sf):
-            packed_sf_raw[valid_expert_local.long(), sf_ch, slot_in_expert.long()] = expanded_sf[:, sf_ch]
-        packed_sf = packed_sf_raw.permute(0, 2, 1)
-
-    return packed_x, packed_sf, expert_counts, valid_expert_local.long(), slot_in_expert.long(), valid_token_idx.long()
-
-
-def _convert_v2_dispatch_to_v1_ll_format(
-    recv_x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
-    recv_topk_ids: Optional[torch.Tensor],
-    handle,
-    original_topk_ids: torch.Tensor,
-    original_topk_weights: torch.Tensor,
-    num_max_dispatch_tokens_per_rank: int,
-    num_ranks: int,
-    num_experts: int,
-    local_rank: int,
-    dispatch_ctx: dict,
-) -> "DeepEPLLDispatchOutput":
-    if isinstance(recv_x, tuple):
-        recv_data, recv_sf = recv_x
-    else:
-        recv_data, recv_sf = recv_x, None
-
-    cached_buffers = dispatch_ctx.get('_cached_buffers')
-    if cached_buffers is None:
-        cached_buffers = {}
-        dispatch_ctx['_cached_buffers'] = cached_buffers
-
-    if handle.do_expand:
-        packed_x, packed_sf, masked_m, starts_list, counts_list = _convert_v2_expand_to_v1(
-            recv_data, recv_sf, handle,
-            num_max_dispatch_tokens_per_rank, num_ranks, num_experts,
-        )
-        dispatch_ctx['starts_list'] = starts_list
-        dispatch_ctx['counts_list'] = counts_list
-        dispatch_ctx['recv_x_shape'] = recv_data.shape
-    else:
-        packed_x, packed_sf, masked_m, valid_expert_local, slot_in_expert, valid_token_idx = _convert_v2_nonexpand_to_v1(
-            recv_data, recv_sf, recv_topk_ids, handle,
-            num_max_dispatch_tokens_per_rank, num_ranks, num_experts, local_rank,
-        )
-        dispatch_ctx['recv_x_shape'] = recv_data.shape
-        dispatch_ctx['valid_expert_local'] = valid_expert_local
-        dispatch_ctx['slot_in_expert'] = slot_in_expert
-        dispatch_ctx['valid_token_idx'] = valid_token_idx
-
-    num_tokens = original_topk_ids.shape[0]
-    num_topk = original_topk_ids.shape[1]
-    expected_m = (num_tokens * num_ranks * num_topk + num_experts) // num_experts
-
-    return DeepEPLLDispatchOutput(
-        hidden_states=packed_x,
-        hidden_states_scale=packed_sf,
-        topk_ids=original_topk_ids,
-        topk_weights=original_topk_weights,
-        masked_m=masked_m,
-        expected_m=expected_m,
-    )
-
-
-def _reverse_scatter_3d_to_v2_flat(
-    hidden_states_3d: torch.Tensor,
-    dispatch_ctx: dict,
-    handle,
-) -> torch.Tensor:
-    if handle.do_expand:
-        starts_list = dispatch_ctx['starts_list']
-        counts_list = dispatch_ctx['counts_list']
-        recv_x_shape = dispatch_ctx['recv_x_shape']
-        E_local = hidden_states_3d.shape[0]
-        H = hidden_states_3d.shape[2]
-
-        flat = hidden_states_3d.new_zeros((recv_x_shape[0], H))
-        for e in range(E_local):
-            c = counts_list[e]
-            s = starts_list[e]
-            if c > 0:
-                flat[s:s + c, :].copy_(hidden_states_3d[e, :c, :], non_blocking=True)
-        return flat
-    else:
-        recv_x_shape = dispatch_ctx['recv_x_shape']
-        valid_expert_local = dispatch_ctx['valid_expert_local']
-        slot_in_expert = dispatch_ctx['slot_in_expert']
-        valid_token_idx = dispatch_ctx['valid_token_idx']
-        H = hidden_states_3d.shape[2]
-        num_recv_tokens = recv_x_shape[0]
-
-        gathered = hidden_states_3d[valid_expert_local, slot_in_expert]
-        flat = torch.zeros(num_recv_tokens, H, dtype=hidden_states_3d.dtype, device=hidden_states_3d.device)
-        flat.scatter_add_(0, valid_token_idx.unsqueeze(1).expand(-1, H), gathered)
-        return flat
-
-
 class _DeepEPDispatcherImplV2(_DeepEPDispatcherImplBase):
     """DeepEP V2 (ElasticBuffer) dispatcher implementation.
     """
@@ -1107,10 +904,8 @@ class _DeepEPDispatcherImplV2(_DeepEPDispatcherImplBase):
         self.async_finish = async_finish
         self.quant_config = {}
         self.num_comm_sms = 0
-        # do_expand controls whether ElasticBuffer performs C++ side expert-sort
-        # (expand) during dispatch. Controlled by env SGLANG_DEEPEP_V2_DO_EXPAND.
-        self.do_expand = get_bool_env_var("SGLANG_DEEPEP_V2_DO_EXPAND", default="true")
         self._dispatch_ctx = {}
+        self.device_module = torch.get_device_module()
 
     def dispatch_a(
         self,
@@ -1119,6 +914,10 @@ class _DeepEPDispatcherImplV2(_DeepEPDispatcherImplBase):
     ):
         """Phase 1 of dispatch: quantize, deduplicate, and issue async communication.
 
+        Deduplication: if a token is routed to the same expert multiple times
+        (duplicate entries in topk_ids), only the first occurrence is kept;
+        later duplicates are masked to -1 with weight 0.
+
         The all-to-all dispatch communication is issued here (on comm_stream)
         so that it can overlap with shared expert computation in the
         _deepep_dispatch_hook that runs between dispatch_a and dispatch_b.
@@ -1126,6 +925,11 @@ class _DeepEPDispatcherImplV2(_DeepEPDispatcherImplBase):
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
         topk_ids = topk_ids.to(torch.int64)
 
+        # Dedup: do_expand=True requires no duplicate expert per token.
+        # Only needed for decode path (is_extend=False → do_expand=True).
+        # For prefill (do_expand=False), duplicates are handled by the kernel.
+        is_extend = get_is_extend_in_batch()
+        if not is_extend:
         num_topk = topk_ids.shape[1]
         if num_topk > 1:
             pair_eq = (topk_ids.unsqueeze(2) == topk_ids.unsqueeze(1))
@@ -1146,28 +950,28 @@ class _DeepEPDispatcherImplV2(_DeepEPDispatcherImplBase):
                 scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
             )
 
-        is_extend = get_is_extend_in_batch()
-
         E_local = self.num_local_experts
         R = self.group.size()
         T_max = self.num_max_dispatch_tokens_per_rank
-        num_topk = topk_ids.shape[1]
         alignment = 128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1
 
         if is_extend:
-            do_expand = True
+            do_expand = False
             expert_alignment = alignment
+            do_cpu_sync = True
+            self._prefill_sync_mode = True
         else:
-            expected_m = (topk_ids.shape[0] * R * num_topk + self.num_experts) // self.num_experts
             do_expand = True
-            expert_alignment = _align_up_val(min(R * T_max, expected_m * 8), 256)
-            expert_alignment = max(expert_alignment, 256)
+            expert_alignment = R * T_max
+            do_cpu_sync = False
+            self._prefill_sync_mode = False
 
-        previous_event = ElasticBuffer.capture() if self.async_finish else None
+        previous_event = ElasticBuffer.capture() if (self.async_finish and not do_cpu_sync) else None
         recv_x, recv_topk_ids, recv_topk_weights, event = self._dispatch_core(
             hidden_states, topk_ids, topk_weights, previous_event,
             do_expand=do_expand,
             expert_alignment=expert_alignment,
+            do_cpu_sync=do_cpu_sync,
         )
 
         return (topk_ids, topk_weights, is_extend, expert_alignment,
@@ -1175,8 +979,17 @@ class _DeepEPDispatcherImplV2(_DeepEPDispatcherImplBase):
 
     def dispatch_b(self, topk_ids, topk_weights, is_extend, expert_alignment,
                    recv_x, recv_topk_ids, recv_topk_weights, event):
-        """Phase 2 of dispatch: wait for communication and format output."""
-        event.current_stream_wait() if self.async_finish else ()
+        """Phase 2 of dispatch: wait for communication and format output.
+
+        Communication was already issued in dispatch_a on the comm_stream.
+        This method waits for it to complete and formats the output:
+          Prefill (is_extend=True): do_expand=False → DeepEPNormalDispatchOutput
+            → ep_scatter → contiguous GEMM (same as V1 normal)
+          Decode (is_extend=False): do_expand=True → view to 3D
+            → DeepEPLLDispatchOutput → masked GEMM
+        """
+        if event is not None and event.event is not None:
+            event.current_stream_wait()
 
         if isinstance(recv_x, tuple):
             recv_hidden, recv_sf = recv_x
@@ -1185,15 +998,17 @@ class _DeepEPDispatcherImplV2(_DeepEPDispatcherImplBase):
 
         if is_extend:
             self._dispatch_ctx = {}
-            return DeepEPV2ExpandDispatchOutput(
+            return DeepEPNormalDispatchOutput(
                 hidden_states=recv_hidden,
                 hidden_states_scale=recv_sf,
-                psum_num_recv_tokens_per_expert=self.handle.psum_num_recv_tokens_per_expert,
-                num_recv_tokens_per_expert_list=self.handle.num_recv_tokens_per_expert_list,
+                topk_ids=recv_topk_ids,
+                topk_weights=recv_topk_weights,
+                num_recv_tokens_per_expert=self.handle.num_recv_tokens_per_expert_list,
             )
 
         E_local = self.num_local_experts
         R = self.group.size()
+        T_max = self.num_max_dispatch_tokens_per_rank
         num_topk = topk_ids.shape[1]
         max_m = expert_alignment
 
@@ -1214,6 +1029,7 @@ class _DeepEPDispatcherImplV2(_DeepEPDispatcherImplBase):
 
         expected_m = (topk_ids.shape[0] * R * num_topk + self.num_experts) // self.num_experts
         self._dispatch_ctx = {}
+        self._num_expanded_tokens = recv_hidden.shape[0]
 
         return DeepEPLLDispatchOutput(
             hidden_states=slab_3d,
@@ -1232,13 +1048,21 @@ class _DeepEPDispatcherImplV2(_DeepEPDispatcherImplBase):
         previous_event,
         do_expand: bool = True,
         expert_alignment: Optional[int] = None,
+        do_cpu_sync: bool = False,
     ):
-        """Execute the ElasticBuffer all-to-all dispatch communication."""
+        """Execute the ElasticBuffer all-to-all dispatch communication.
+
+        do_expand controls the output layout:
+          False (prefill): deduplicated 2D, do_cpu_sync=True for CPU token counts
+          True (decode): expanded 2D sorted by expert, do_cpu_sync=False
+        """
         buffer = self._get_buffer()
         _deepep_precompile_tp_barrier()
 
         if expert_alignment is None:
             expert_alignment = 128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1
+
+        use_async = self.async_finish and not do_cpu_sync
 
         (
             recv_x,
@@ -1254,11 +1078,11 @@ class _DeepEPDispatcherImplV2(_DeepEPDispatcherImplBase):
             num_max_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
             expert_alignment=expert_alignment,
             num_sms=self.num_comm_sms,
-            previous_event=previous_event,
-            async_with_compute_stream=self.async_finish,
-            allocate_on_comm_stream=(previous_event is not None) and self.async_finish,
+            previous_event=previous_event if use_async else None,
+            async_with_compute_stream=use_async,
+            allocate_on_comm_stream=(previous_event is not None) and use_async,
             do_expand=do_expand,
-            do_cpu_sync=False,
+            do_cpu_sync=do_cpu_sync,
             use_tma_aligned_col_major_sf=(
                 deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
                 and deep_gemm_wrapper.DEEPGEMM_BLACKWELL
@@ -1278,7 +1102,12 @@ class _DeepEPDispatcherImplV2(_DeepEPDispatcherImplBase):
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
-        """Phase 1 of combine: prepare GEMM output and capture event."""
+        """Phase 1 of combine: prepare GEMM output for V2 combine.
+
+        Prefill (contiguous GEMM): output is 2D flat - pass through.
+        Decode (masked GEMM): output is 3D [E, M, H] - view to 2D flat,
+          then slice to actual expanded token count for efficient combine.
+        """
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter or _is_npu:
             output = hidden_states
         else:
@@ -1287,29 +1116,59 @@ class _DeepEPDispatcherImplV2(_DeepEPDispatcherImplBase):
         if output.dim() == 3:
             output = output.view(-1, output.shape[-1])
 
-        previous_event = ElasticBuffer.capture() if self.async_finish else None
+        if hasattr(self, '_num_expanded_tokens') and self._num_expanded_tokens < output.shape[0]:
+            output = output[:self._num_expanded_tokens]
+
+        self._combine_topk_weights = topk_weights
+        self._combine_use_async = self.async_finish and not getattr(self, '_prefill_sync_mode', False)
+        previous_event = ElasticBuffer.capture() if self._combine_use_async else None
         return output, previous_event
 
     def combine_b(self, output, previous_event):
         """Phase 2 of combine: execute V2 ElasticBuffer combine communication."""
+        overlap_args = self.overlap_args
+
+        if overlap_args is not None:
+            overlap_args.stream.wait_event(overlap_args.wait_event)
+            with torch.cuda.stream(overlap_args.stream):
         hidden_states, event = self._combine_core(output, previous_event)
-        event.current_stream_wait() if self.async_finish else ()
+                if event is not None and event.event is not None:
+                    event.current_stream_wait()
+        else:
+            hidden_states, event = self._combine_core(output, previous_event)
+            if event is not None and event.event is not None:
+                event.current_stream_wait()
+
         self.handle = None
         self._dispatch_ctx = {}
+
+        if overlap_args is not None:
+            self.device_module.current_stream().wait_stream(overlap_args.stream)
+
         return hidden_states
 
     def _combine_core(self, x: torch.Tensor, previous_event):
         buffer = self._get_buffer()
         _deepep_precompile_tp_barrier()
 
+        topk_weights = getattr(self, '_combine_topk_weights', None)
+        if self.handle is not None and not self.handle.do_expand:
+            pass
+        else:
+            topk_weights = None
+
+        use_async = getattr(self, '_combine_use_async', self.async_finish)
+
         combined_x, _, event = buffer.combine(
             x,
             self.handle,
+            topk_weights=topk_weights,
             num_sms=self.num_comm_sms,
             previous_event=previous_event,
-            async_with_compute_stream=self.async_finish,
+            async_with_compute_stream=use_async,
             allocate_on_comm_stream=previous_event is not None,
         )
+        self._combine_topk_weights = None
         return combined_x, event
 
     def _get_buffer(self):
@@ -1326,6 +1185,10 @@ class _DeepEPDispatcherImplV2(_DeepEPDispatcherImplBase):
             self.num_comm_sms = buffer.get_theoretical_num_sms(
                 self.num_experts, self.router_topk
             )
+            # logger.info(
+            #     "DeepEP V2 num_comm_sms=%d (num_experts=%d, router_topk=%d)",
+            #     self.num_comm_sms, self.num_experts, self.router_topk,
+            # )
         return buffer
 
 @dataclass

@@ -164,6 +164,7 @@ class DispatchOutputFormat(Enum):
     DEEPEP_NORMAL = "deepep_normal"
     DEEPEP_LL = "deepep_ll"
     DEEPEP_V2_EXPAND = "deepep_v2_expand"
+    DEEPEP_V2_NORMAL = "deepep_v2_normal"
     FLASHINFER = "flashinfer"
 
     def is_standard(self) -> bool:
@@ -238,6 +239,7 @@ class CombineInputFormat(Enum):
     DEEPEP_NORMAL = "deepep_normal"
     DEEPEP_LL = "deepep_ll"
     DEEPEP_V2_EXPAND = "deepep_v2_expand"
+    DEEPEP_V2_NORMAL = "deepep_v2_normal"
     FLASHINFER = "flashinfer"
 
 

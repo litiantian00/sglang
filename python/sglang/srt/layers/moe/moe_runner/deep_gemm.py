@@ -818,6 +818,139 @@ def post_permute_deep_gemm_to_deepep_normal(
     )
 
 
+@register_pre_permute("deepep_v2_normal", "deep_gemm")
+def pre_permute_deepep_v2_normal_to_deep_gemm(
+    dispatch_output: "DeepEPV2NormalDispatchOutput",
+    quant_info: DeepGemmMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> DeepGemmRunnerInput:
+    """Pre-permute for V2 normal dispatch output (do_expand=False, no CPU sync).
+
+    Computes per-expert actual token counts from recv_topk_ids on GPU,
+    avoiding the do_cpu_sync overhead of the V1 normal path.
+    """
+    from sglang.srt.layers.moe.ep_moe.kernels import ep_scatter
+    from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPV2NormalDispatchOutput
+
+    (
+        hidden_states,
+        hidden_states_scale,
+        topk_ids,
+        topk_weights,
+        psum_num_recv_tokens_per_expert,
+        num_total_alloc,
+    ) = dispatch_output
+    assert runner_config.activation == "silu"
+
+    psum = psum_num_recv_tokens_per_expert
+    num_recv_tokens_per_expert_gpu = torch.empty_like(psum)
+    num_recv_tokens_per_expert_gpu[0] = psum[0]
+    if psum.shape[0] > 1:
+        num_recv_tokens_per_expert_gpu[1:] = psum[1:] - psum[:-1]
+
+    all_tokens = psum[-1].item()
+    running_state["all_tokens"] = all_tokens
+
+    K = hidden_states.shape[1]
+
+    running_state["hidden_states_shape"] = (num_total_alloc, K)
+    running_state["hidden_states_device"] = hidden_states.device
+    running_state["hidden_states_dtype"] = hidden_states.dtype
+    running_state["topk_ids"] = topk_ids
+    running_state["topk_weights"] = topk_weights
+
+    input_tensor = torch.empty(
+        (all_tokens, K),
+        device=hidden_states.device,
+        dtype=hidden_states.dtype,
+    )
+    if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+        input_tensor_scale = torch.zeros(
+            (ceil_div(K // 128, 4), all_tokens),
+            device=hidden_states.device,
+            dtype=torch.int,
+        ).transpose(0, 1)
+    else:
+        input_tensor_scale = torch.empty(
+            (all_tokens, K // 128),
+            device=hidden_states.device,
+            dtype=torch.float32,
+        )
+    m_indices = torch.empty(all_tokens, device=hidden_states.device, dtype=torch.int32)
+    output_index = torch.empty_like(topk_ids)
+
+    expert_start_loc = torch.empty_like(num_recv_tokens_per_expert_gpu)
+
+    ep_scatter(
+        hidden_states,
+        hidden_states_scale,
+        topk_ids,
+        num_recv_tokens_per_expert_gpu,
+        expert_start_loc,
+        input_tensor,
+        input_tensor_scale,
+        m_indices,
+        output_index,
+        scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+    )
+    dispose_tensor(hidden_states)
+    if hidden_states_scale is not None:
+        dispose_tensor(hidden_states_scale)
+
+    running_state["output_index"] = output_index
+
+    return DeepGemmRunnerInput(
+        hidden_states=input_tensor,
+        hidden_states_scale=input_tensor_scale,
+        use_masked_gemm=False,
+        m_indices=m_indices,
+    )
+
+
+@register_post_permute("deep_gemm", "deepep_v2_normal")
+def post_permute_deep_gemm_to_deepep_v2_normal(
+    runner_output: DeepGemmRunnerOutput,
+    quant_info: DeepGemmMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> "DeepEPNormalCombineInput":
+    from sglang.srt.layers.moe.ep_moe.kernels import ep_gather
+    from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPNormalCombineInput
+
+    hidden_states = runner_output.hidden_states
+    topk_ids = running_state["topk_ids"]
+    topk_weights = running_state["topk_weights"]
+    output_index = running_state["output_index"]
+
+    num_recv = topk_ids.shape[0]
+    combine_shape = running_state["hidden_states_shape"]
+    H = hidden_states.shape[1]
+
+    gather_out_recv = torch.zeros(
+        (num_recv, H),
+        device=running_state["hidden_states_device"],
+        dtype=torch.bfloat16,
+    )
+    ep_gather(hidden_states, topk_ids, topk_weights, output_index, gather_out_recv)
+
+    if num_recv == combine_shape[0]:
+        gather_out = gather_out_recv
+    else:
+        gather_out = torch.zeros(
+            combine_shape,
+            device=running_state["hidden_states_device"],
+            dtype=torch.bfloat16,
+        )
+        gather_out[:num_recv] = gather_out_recv
+
+    return DeepEPNormalCombineInput(
+        hidden_states=gather_out,
+        topk_ids=running_state["topk_ids"],
+        topk_weights=running_state["topk_weights"],
+    )
+
+
 @register_pre_permute("deepep_v2_expand", "deep_gemm")
 def pre_permute_deepep_v2_expand_to_deep_gemm(
     dispatch_output: "DeepEPV2ExpandDispatchOutput",
