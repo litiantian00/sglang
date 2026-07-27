@@ -1,6 +1,7 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import logging
+import os
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
@@ -72,6 +73,13 @@ except ImportError:
     ElasticBuffer = None
     have_deepep_v2 = False
 
+import inspect
+
+_dispatch_supports_3d_sf = (
+    have_deepep_v2
+    and 'use_3d_sf_layout' in inspect.signature(ElasticBuffer.dispatch).parameters
+)
+
 from enum import Enum, IntEnum, auto
 
 import torch
@@ -80,6 +88,28 @@ import torch.distributed as dist
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 logger = logging.getLogger(__name__)
+
+
+def _copy_rows_by_index(
+    dst: torch.Tensor,
+    dst_idx: torch.Tensor,
+    src: torch.Tensor,
+    src_idx: torch.Tensor,
+) -> None:
+    """dst[dst_idx] = src[src_idx], row-wise, supporting Float8_e4m3fn.
+
+    torch's index_copy_/index_select are not implemented for Float8_e4m3fn on CUDA,
+    so for such dtypes we operate on a uint8 byte view (pure data movement, dtype
+    semantics irrelevant). Both dst and src must be 2D and share the same dtype/width.
+    """
+    if src_idx.numel() == 0:
+        return
+    if dst.dtype == torch.float8_e4m3fn:
+        dst.view(torch.uint8).index_copy_(
+            0, dst_idx, src.view(torch.uint8).index_select(0, src_idx)
+        )
+    else:
+        dst.index_copy_(0, dst_idx, src.index_select(0, src_idx))
 
 
 def _deepep_precompile_tp_barrier() -> None:
@@ -350,21 +380,25 @@ class DeepEPBuffer:
             backend.is_deep_gemm() and envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
         )
         use_fp8 = deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and not need_bf16_dispatch
+        allow_multiple_reduction = int(os.environ.get("EP_MULTIPLE_REDUCTION", "1")) != 0
 
         logger.info(
             "SGLANG_DEEPEP_USE_V2=1: constructing deep_ep.ElasticBuffer "
-            "(num_max_tokens_per_rank=%d, hidden=%d, num_topk=%d, use_fp8_dispatch=%s).",
+            "(num_max_tokens_per_rank=%d, hidden=%d, num_topk=%d, use_fp8_dispatch=%s, multiple_reduction=%d).",
             num_max_dispatch_tokens_per_rank,
             hidden_size,
             num_topk,
             use_fp8,
+            allow_multiple_reduction,
         )
+
         return ElasticBuffer(
             group=group,
             num_max_tokens_per_rank=num_max_dispatch_tokens_per_rank,
             hidden=hidden_size,
             num_topk=num_topk,
             use_fp8_dispatch=use_fp8,
+            allow_multiple_reduction=allow_multiple_reduction,
         )
 
     @classmethod
@@ -899,6 +933,9 @@ class _DeepEPDispatcherImplV2(_DeepEPDispatcherImplBase):
     """DeepEP V2 (ElasticBuffer) dispatcher implementation.
     """
 
+    _shared_grid_hidden = None
+    _shared_combine_compact_buf = None
+
     def __init__(self, async_finish: bool, **kwargs):
         super().__init__(**kwargs)
         self.async_finish = async_finish
@@ -906,36 +943,35 @@ class _DeepEPDispatcherImplV2(_DeepEPDispatcherImplBase):
         self.num_comm_sms = 0
         self._dispatch_ctx = {}
         self.device_module = torch.get_device_module()
+        self._grid_sf = None
+        self._expand_dst_idx = None
+        self._expand_src_idx = None
+        R = self.group.size()
+        T_max = self.num_max_dispatch_tokens_per_rank
+        E_local = self.num_local_experts
+        H = self.hidden_size
+        total_slots = E_local * R * T_max
+        if _DeepEPDispatcherImplV2._shared_grid_hidden is None:
+            _DeepEPDispatcherImplV2._shared_grid_hidden = torch.empty(
+                (total_slots, H), dtype=torch.float8_e4m3fn, device="cuda"
+            )
+            _DeepEPDispatcherImplV2._shared_combine_compact_buf = torch.zeros(
+                (total_slots, H), dtype=torch.bfloat16, device="cuda"
+            )
 
     def dispatch_a(
         self,
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
     ):
-        """Phase 1 of dispatch: quantize, deduplicate, and issue async communication.
-
-        Deduplication: if a token is routed to the same expert multiple times
-        (duplicate entries in topk_ids), only the first occurrence is kept;
-        later duplicates are masked to -1 with weight 0.
-
-        The all-to-all dispatch communication is issued here (on comm_stream)
-        so that it can overlap with shared expert computation in the
-        _deepep_dispatch_hook that runs between dispatch_a and dispatch_b.
-        """
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
         topk_ids = topk_ids.to(torch.int64)
 
-        # Dedup: do_expand=True requires no duplicate expert per token.
-        # Only needed for decode path (is_extend=False → do_expand=True).
-        # For prefill (do_expand=False), duplicates are handled by the kernel.
         is_extend = get_is_extend_in_batch()
-        if not is_extend:
-        num_topk = topk_ids.shape[1]
-        if num_topk > 1:
-            pair_eq = (topk_ids.unsqueeze(2) == topk_ids.unsqueeze(1))
-            is_later_dup = pair_eq.triu(diagonal=1).any(dim=2)
-            topk_ids = topk_ids.masked_fill(is_later_dup, -1)
-            topk_weights = topk_weights.masked_fill(is_later_dup, 0.0)
+
+        all_zero_mask = (topk_ids == 0).all(dim=1)
+        topk_ids = topk_ids.masked_fill(all_zero_mask.unsqueeze(1), -1)
+        topk_weights = topk_weights.masked_fill(all_zero_mask.unsqueeze(1), 0.0)
 
         backend = get_moe_runner_backend()
         need_bf16_dispatch = backend.is_cutlass() or (
@@ -979,15 +1015,6 @@ class _DeepEPDispatcherImplV2(_DeepEPDispatcherImplBase):
 
     def dispatch_b(self, topk_ids, topk_weights, is_extend, expert_alignment,
                    recv_x, recv_topk_ids, recv_topk_weights, event):
-        """Phase 2 of dispatch: wait for communication and format output.
-
-        Communication was already issued in dispatch_a on the comm_stream.
-        This method waits for it to complete and formats the output:
-          Prefill (is_extend=True): do_expand=False → DeepEPNormalDispatchOutput
-            → ep_scatter → contiguous GEMM (same as V1 normal)
-          Decode (is_extend=False): do_expand=True → view to 3D
-            → DeepEPLLDispatchOutput → masked GEMM
-        """
         if event is not None and event.event is not None:
             event.current_stream_wait()
 
@@ -998,13 +1025,18 @@ class _DeepEPDispatcherImplV2(_DeepEPDispatcherImplBase):
 
         if is_extend:
             self._dispatch_ctx = {}
-            return DeepEPNormalDispatchOutput(
+            self._expand_dst_idx = None
+            self._expand_src_idx = None
+
+            v2_output = DeepEPNormalDispatchOutput(
                 hidden_states=recv_hidden,
                 hidden_states_scale=recv_sf,
                 topk_ids=recv_topk_ids,
                 topk_weights=recv_topk_weights,
                 num_recv_tokens_per_expert=self.handle.num_recv_tokens_per_expert_list,
             )
+
+            return v2_output
 
         E_local = self.num_local_experts
         R = self.group.size()
@@ -1013,23 +1045,80 @@ class _DeepEPDispatcherImplV2(_DeepEPDispatcherImplBase):
         max_m = expert_alignment
 
         H = recv_hidden.shape[-1]
+
+        # V2 expand layout is COMPACT + per-expert alignment, NOT a fixed
+        # [E_local, max_m] grid. Data for expert e lives at:
+        #   start_e = align(psum_padded[e], max_m); count_e = psum_padded[e+1] - start_e
+        # where psum_padded = [0] + psum. A naive view(E_local, max_m, H) reads the
+        # wrong offsets. We scatter the compact rows into a preallocated fixed grid
+        # so that grid[e, :count_e] == expert e's real tokens (padding is garbage but
+        # unused: DeepGEMM masked GEMM only reads the first masked_m[e] rows).
+        psum = self.handle.psum_num_recv_tokens_per_expert  # inclusive, aligned prefix sum
+        psum_padded = torch.cat(
+            [psum.new_zeros(1), psum]
+        )  # [E_local + 1], psum_padded[0] = 0
+
+        # start_e = align(psum_padded[e], max_m), count_e = psum_padded[e+1] - start_e
+        starts = ((psum_padded[:-1] + max_m - 1) // max_m) * max_m  # [E_local]
+        masked_m = (psum_padded[1:] - starts).to(torch.int32)  # [E_local]
+
+        # Scatter compact rows into the fixed grid using pure GPU ops (no .item(),
+        # no boolean indexing, no Python loops) for cuda graph compatibility.
         total_slots = E_local * max_m
-        slab_3d = recv_hidden[:total_slots].view(E_local, max_m, H)
+        grid_hidden = _DeepEPDispatcherImplV2._shared_grid_hidden
+
+        # Build full [E_local, max_m] index grids on GPU (fixed shape, no .item())
+        row_offsets = torch.arange(max_m, device=recv_hidden.device).unsqueeze(0)  # [1, max_m]
+        src_all = starts.unsqueeze(1) + row_offsets      # [E_local, max_m] compact src indices
+        dst_all = (torch.arange(E_local, device=recv_hidden.device) * max_m).unsqueeze(1) + row_offsets  # [E_local, max_m] grid dst indices
+        valid_mask = row_offsets < masked_m.unsqueeze(1)  # [E_local, max_m] bool
+
+        # Clamp invalid src indices to 0 (they will be overwritten or ignored by GEMM)
+        src_flat = src_all.clamp(max=recv_hidden.shape[0] - 1).view(-1)  # [E_local*max_m]
+        dst_flat = dst_all.view(-1)                                       # [E_local*max_m]
+        valid_flat = valid_mask.view(-1)                                  # [E_local*max_m]
+
+        # Copy ALL rows (including invalid → garbage, but masked GEMM ignores them)
+        _copy_rows_by_index(grid_hidden, dst_flat, recv_hidden, src_flat)
+        slab_3d = grid_hidden.view(E_local, max_m, H)
+
+        # Save the VALID grid<->compact row maps for combine inverse gather.
+        # torch.where returns fixed-shape when given full args (no dynamic indexing).
+        # For combine we only need valid indices, but we must build them without .item().
+        # Store the full maps + mask; combine_a will filter using the mask.
+        # Save the grid<->compact row maps for combine inverse gather.
+        # For invalid rows (where valid_mask=False), set src to dst (identity mapping)
+        # so index_copy_ in combine won't have duplicate targets.
+        safe_src = torch.where(valid_mask.view(-1), src_all.view(-1), dst_flat)
+        self._expand_dst_all = dst_flat
+        self._expand_src_all = safe_src
+        self._expand_valid_mask = valid_mask.view(-1)
+        self._expand_compact_rows = psum_padded[-1]
+
         slab_sf_3d = None
         if recv_sf is not None:
-            sf_dim = recv_sf.shape[-1]
-            slab_sf_3d = recv_sf[:total_slots].view(E_local, max_m, sf_dim)
-
-        psum = self.handle.psum_num_recv_tokens_per_expert
-        masked_m = torch.empty(E_local, dtype=torch.int32, device=psum.device)
-        masked_m[0] = psum[0]
-        if E_local > 1:
-            psum_aligned_prev = ((psum[:-1] + max_m - 1) // max_m) * max_m
-            masked_m[1:] = psum[1:] - psum_aligned_prev
-
+            if recv_sf.dim() == 3:
+                # SF already in fixed [E_local, tokens_per_expert, sf_dim] grid
+                # (use_3d_sf_layout=True). Its per-expert row layout matches the
+                # scattered hidden grid (expert e's data in rows [0, count_e)),
+                # so it can be consumed directly.
+                slab_sf_3d = recv_sf
+            else:
+                # 2D compact SF: scatter into a fixed grid the same way as hidden.
+                sf_dim = recv_sf.shape[-1]
+                if (
+                    getattr(self, "_grid_sf", None) is None
+                    or self._grid_sf.shape != (total_slots, sf_dim)
+                    or self._grid_sf.dtype != recv_sf.dtype
+                ):
+                    self._grid_sf = recv_sf.new_empty((total_slots, sf_dim))
+                grid_sf = self._grid_sf
+                sf_src = src_all.clamp(max=recv_sf.shape[0] - 1).view(-1)
+                grid_sf.index_copy_(0, dst_flat, recv_sf.index_select(0, sf_src))
+                slab_sf_3d = grid_sf.view(E_local, max_m, sf_dim)
         expected_m = (topk_ids.shape[0] * R * num_topk + self.num_experts) // self.num_experts
         self._dispatch_ctx = {}
-        self._num_expanded_tokens = recv_hidden.shape[0]
+        self._num_expanded_tokens = psum_padded[-1]
 
         return DeepEPLLDispatchOutput(
             hidden_states=slab_3d,
@@ -1064,6 +1153,18 @@ class _DeepEPDispatcherImplV2(_DeepEPDispatcherImplBase):
 
         use_async = self.async_finish and not do_cpu_sync
 
+        extra_kwargs = {}
+        if _dispatch_supports_3d_sf:
+            extra_kwargs['use_3d_sf_layout'] = do_expand
+
+        # logger.info(
+        #     f"[V2 dispatch] extra_kwargs={extra_kwargs}, "
+        #     f"_dispatch_supports_3d_sf={_dispatch_supports_3d_sf}, "
+        #     f"do_expand={do_expand}, do_cpu_sync={do_cpu_sync}, "
+        #     f"use_async={use_async}, expert_alignment={expert_alignment}, "
+        #     f"num_sms={self.num_comm_sms}"
+        # )
+
         (
             recv_x,
             recv_topk_ids,
@@ -1085,8 +1186,9 @@ class _DeepEPDispatcherImplV2(_DeepEPDispatcherImplBase):
             do_cpu_sync=do_cpu_sync,
             use_tma_aligned_col_major_sf=(
                 deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL
+                and (deep_gemm_wrapper.DEEPGEMM_BLACKWELL or do_expand)
             ),
+            **extra_kwargs,
         )
 
         return (
@@ -1102,12 +1204,6 @@ class _DeepEPDispatcherImplV2(_DeepEPDispatcherImplBase):
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
-        """Phase 1 of combine: prepare GEMM output for V2 combine.
-
-        Prefill (contiguous GEMM): output is 2D flat - pass through.
-        Decode (masked GEMM): output is 3D [E, M, H] - view to 2D flat,
-          then slice to actual expanded token count for efficient combine.
-        """
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter or _is_npu:
             output = hidden_states
         else:
@@ -1116,8 +1212,18 @@ class _DeepEPDispatcherImplV2(_DeepEPDispatcherImplBase):
         if output.dim() == 3:
             output = output.view(-1, output.shape[-1])
 
-        if hasattr(self, '_num_expanded_tokens') and self._num_expanded_tokens < output.shape[0]:
-            output = output[:self._num_expanded_tokens]
+        expand_dst_all = getattr(self, "_expand_dst_all", None)
+        if expand_dst_all is not None:
+            src_all = self._expand_src_all
+            dst_expanded = expand_dst_all.unsqueeze(1).expand_as(output)
+            src_expanded = src_all.unsqueeze(1).expand_as(output)
+            compact = _DeepEPDispatcherImplV2._shared_combine_compact_buf
+            compact.zero_()
+            compact.scatter_(0, src_expanded, output.gather(0, dst_expanded))
+            output = compact
+            self._expand_dst_all = None
+            self._expand_src_all = None
+            self._expand_valid_mask = None
 
         self._combine_topk_weights = topk_weights
         self._combine_use_async = self.async_finish and not getattr(self, '_prefill_sync_mode', False)
@@ -1131,7 +1237,7 @@ class _DeepEPDispatcherImplV2(_DeepEPDispatcherImplBase):
         if overlap_args is not None:
             overlap_args.stream.wait_event(overlap_args.wait_event)
             with torch.cuda.stream(overlap_args.stream):
-        hidden_states, event = self._combine_core(output, previous_event)
+                hidden_states, event = self._combine_core(output, previous_event)
                 if event is not None and event.event is not None:
                     event.current_stream_wait()
         else:
@@ -1152,9 +1258,7 @@ class _DeepEPDispatcherImplV2(_DeepEPDispatcherImplBase):
         _deepep_precompile_tp_barrier()
 
         topk_weights = getattr(self, '_combine_topk_weights', None)
-        if self.handle is not None and not self.handle.do_expand:
-            pass
-        else:
+        if self.handle is not None and self.handle.do_expand:
             topk_weights = None
 
         use_async = getattr(self, '_combine_use_async', self.async_finish)
