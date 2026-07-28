@@ -1625,3 +1625,145 @@ def fp8_per_token_to_per_tensor_quant_triton(
         K_BLOCK_SIZE=K_BLOCK_SIZE,
         num_warps=8,
     )
+
+
+# ---------------------------------------------------------------------------
+# DeepEP V2 repack kernels: compact ↔ masked slab [E_local, max_m, H]
+# Fixed grid (E_local, NUM_WORKERS), cuda-graph safe.
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _epv2_expand_to_slab_kernel(
+    recv_ptr, slab_ptr, psum_ptr,
+    max_m: tl.constexpr, H: tl.constexpr,
+    BLOCK_H: tl.constexpr, NUM_WORKERS: tl.constexpr,
+):
+    expert_id = tl.program_id(0)
+    worker_id = tl.program_id(1)
+
+    prev_psum = tl.load(psum_ptr + expert_id).to(tl.int64)
+    cur_psum = tl.load(psum_ptr + expert_id + 1).to(tl.int64)
+    start = ((prev_psum + max_m - 1) // max_m) * max_m
+    count = cur_psum - start
+
+    j = worker_id
+    while j < count:
+        src_off = (start + j) * H
+        dst_off = (tl.cast(expert_id, tl.int64) * max_m + j) * H
+        for h_off in tl.range(0, H, BLOCK_H):
+            cols = h_off + tl.arange(0, BLOCK_H)
+            mask = cols < H
+            vals = tl.load(recv_ptr + src_off + cols, mask=mask)
+            tl.store(slab_ptr + dst_off + cols, vals, mask=mask)
+        j += NUM_WORKERS
+
+
+@triton.jit
+def _epv2_slab_to_expand_kernel(
+    slab_ptr, compact_ptr, psum_ptr,
+    max_m: tl.constexpr, H: tl.constexpr,
+    BLOCK_H: tl.constexpr, NUM_WORKERS: tl.constexpr,
+):
+    expert_id = tl.program_id(0)
+    worker_id = tl.program_id(1)
+
+    prev_psum = tl.load(psum_ptr + expert_id).to(tl.int64)
+    cur_psum = tl.load(psum_ptr + expert_id + 1).to(tl.int64)
+    start = ((prev_psum + max_m - 1) // max_m) * max_m
+    count = cur_psum - start
+
+    j = worker_id
+    while j < count:
+        src_off = (tl.cast(expert_id, tl.int64) * max_m + j) * H
+        dst_off = (start + j) * H
+        for h_off in tl.range(0, H, BLOCK_H):
+            cols = h_off + tl.arange(0, BLOCK_H)
+            mask = cols < H
+            vals = tl.load(slab_ptr + src_off + cols, mask=mask)
+            tl.store(compact_ptr + dst_off + cols, vals, mask=mask)
+        j += NUM_WORKERS
+
+
+@triton.jit
+def _epv2_slab_to_expand_weighted_kernel(
+    slab_ptr, compact_ptr, psum_ptr, weights_ptr,
+    max_m: tl.constexpr, H: tl.constexpr,
+    BLOCK_H: tl.constexpr, NUM_WORKERS: tl.constexpr,
+):
+    expert_id = tl.program_id(0)
+    worker_id = tl.program_id(1)
+
+    prev_psum = tl.load(psum_ptr + expert_id).to(tl.int64)
+    cur_psum = tl.load(psum_ptr + expert_id + 1).to(tl.int64)
+    start = ((prev_psum + max_m - 1) // max_m) * max_m
+    count = cur_psum - start
+
+    j = worker_id
+    while j < count:
+        row_idx = start + j
+        w = tl.load(weights_ptr + row_idx).to(tl.bfloat16)
+        src_off = (tl.cast(expert_id, tl.int64) * max_m + j) * H
+        dst_off = row_idx * H
+        for h_off in tl.range(0, H, BLOCK_H):
+            cols = h_off + tl.arange(0, BLOCK_H)
+            mask = cols < H
+            vals = tl.load(slab_ptr + src_off + cols, mask=mask).to(tl.bfloat16)
+            tl.store(compact_ptr + dst_off + cols, vals * w, mask=mask)
+        j += NUM_WORKERS
+
+
+_EPV2_NUM_WORKERS = 64
+_EPV2_BLOCK_H = 128
+
+
+def epv2_expand_to_masked_slab(recv_hidden, psum_padded, max_m, E_local):
+    H = recv_hidden.shape[1]
+    slab = torch.empty(
+        (E_local, max_m, H), dtype=recv_hidden.dtype, device=recv_hidden.device
+    )
+    if recv_hidden.dtype == torch.float8_e4m3fn:
+        recv_flat = recv_hidden.view(torch.uint8)
+        slab_flat = slab.view(torch.uint8).view(-1, H)
+    else:
+        recv_flat = recv_hidden
+        slab_flat = slab.view(-1, H)
+    _epv2_expand_to_slab_kernel[
+        (E_local, _EPV2_NUM_WORKERS)
+    ](
+        recv_flat, slab_flat, psum_padded,
+        max_m=max_m, H=H,
+        BLOCK_H=_EPV2_BLOCK_H, NUM_WORKERS=_EPV2_NUM_WORKERS,
+    )
+    return slab
+
+
+def epv2_masked_slab_to_expand(slab, psum_padded, max_m, total_expanded):
+    E_local = slab.shape[0]
+    H = slab.shape[2]
+    compact = torch.empty(
+        (total_expanded, H), dtype=slab.dtype, device=slab.device
+    )
+    _epv2_slab_to_expand_kernel[
+        (E_local, _EPV2_NUM_WORKERS)
+    ](
+        slab.reshape(-1, H), compact, psum_padded,
+        max_m=max_m, H=H,
+        BLOCK_H=_EPV2_BLOCK_H, NUM_WORKERS=_EPV2_NUM_WORKERS,
+    )
+    return compact
+
+
+def epv2_masked_slab_to_expand_weighted(slab, psum_padded, max_m, total_expanded, weights):
+    E_local = slab.shape[0]
+    H = slab.shape[2]
+    compact = torch.empty(
+        (total_expanded, H), dtype=torch.bfloat16, device=slab.device
+    )
+    _epv2_slab_to_expand_weighted_kernel[
+        (E_local, _EPV2_NUM_WORKERS)
+    ](
+        slab.reshape(-1, H), compact, psum_padded, weights,
+        max_m=max_m, H=H,
+        BLOCK_H=_EPV2_BLOCK_H, NUM_WORKERS=_EPV2_NUM_WORKERS,
+    )
+    return compact

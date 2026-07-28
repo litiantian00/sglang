@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import logging
 import os
@@ -88,6 +88,8 @@ import torch.distributed as dist
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 logger = logging.getLogger(__name__)
+
+_V2_COMBINE_DEBUG = get_bool_env_var("SGLANG_V2_COMBINE_DEBUG", default="false")
 
 
 def _copy_rows_by_index(
@@ -252,6 +254,7 @@ class DeepEPDispatchMode(IntEnum):
 
 class DeepEPBuffer:
     _buffer = None
+    _v1_ll_buffer = None
     _dispatch_mode: Optional[DeepEPDispatchMode] = None
     _hidden_size: Optional[int] = None
     _num_max_dispatch_tokens_per_rank: Optional[int] = None
@@ -391,6 +394,24 @@ class DeepEPBuffer:
             use_fp8,
             allow_multiple_reduction,
         )
+
+        if _V2_COMBINE_DEBUG and cls._v1_ll_buffer is None:
+            num_rdma_bytes = Buffer.get_low_latency_rdma_size_hint(
+                num_max_dispatch_tokens_per_rank,
+                hidden_size,
+                group.size(),
+                num_experts,
+            )
+            num_qps_per_rank = num_experts // group.size()
+            logger.info(
+                "[V2_COMBINE_DEBUG] Creating V1 LL Buffer for combine comparison"
+            )
+            cls._v1_ll_buffer = Buffer(
+                group, 0, num_rdma_bytes,
+                low_latency_mode=True,
+                num_qps_per_rank=num_qps_per_rank,
+                allow_mnnvl=True,
+            )
 
         return ElasticBuffer(
             group=group,
@@ -933,9 +954,6 @@ class _DeepEPDispatcherImplV2(_DeepEPDispatcherImplBase):
     """DeepEP V2 (ElasticBuffer) dispatcher implementation.
     """
 
-    _shared_grid_hidden = None
-    _shared_combine_compact_buf = None
-
     def __init__(self, async_finish: bool, **kwargs):
         super().__init__(**kwargs)
         self.async_finish = async_finish
@@ -944,20 +962,14 @@ class _DeepEPDispatcherImplV2(_DeepEPDispatcherImplBase):
         self._dispatch_ctx = {}
         self.device_module = torch.get_device_module()
         self._grid_sf = None
-        self._expand_dst_idx = None
-        self._expand_src_idx = None
-        R = self.group.size()
-        T_max = self.num_max_dispatch_tokens_per_rank
-        E_local = self.num_local_experts
-        H = self.hidden_size
-        total_slots = E_local * R * T_max
-        if _DeepEPDispatcherImplV2._shared_grid_hidden is None:
-            _DeepEPDispatcherImplV2._shared_grid_hidden = torch.empty(
-                (total_slots, H), dtype=torch.float8_e4m3fn, device="cuda"
-            )
-            _DeepEPDispatcherImplV2._shared_combine_compact_buf = torch.zeros(
-                (total_slots, H), dtype=torch.bfloat16, device="cuda"
-            )
+        self._expand_psum_padded = None
+        self._expand_compact_rows = None
+        self._expand_recv_topk_weights = None
+        self._debug_v1_handle = None
+        self._debug_v1_recv_count = None
+        self._debug_dedup_topk_ids = None
+        self._debug_dedup_topk_weights = None
+        self._debug_orig_hidden_bf16 = None
 
     def dispatch_a(
         self,
@@ -969,9 +981,17 @@ class _DeepEPDispatcherImplV2(_DeepEPDispatcherImplBase):
 
         is_extend = get_is_extend_in_batch()
 
+        # DEBUG: save for V1 LL combine comparison
+        if _V2_COMBINE_DEBUG and not is_extend:
+            self._debug_orig_hidden_bf16 = hidden_states.clone()
+
         all_zero_mask = (topk_ids == 0).all(dim=1)
         topk_ids = topk_ids.masked_fill(all_zero_mask.unsqueeze(1), -1)
         topk_weights = topk_weights.masked_fill(all_zero_mask.unsqueeze(1), 0.0)
+
+        if _V2_COMBINE_DEBUG and not is_extend:
+            self._debug_dedup_topk_ids = topk_ids.clone()
+            self._debug_dedup_topk_weights = topk_weights.clone()
 
         backend = get_moe_runner_backend()
         need_bf16_dispatch = backend.is_cutlass() or (
@@ -1025,8 +1045,8 @@ class _DeepEPDispatcherImplV2(_DeepEPDispatcherImplBase):
 
         if is_extend:
             self._dispatch_ctx = {}
-            self._expand_dst_idx = None
-            self._expand_src_idx = None
+            self._expand_psum_padded = None
+            self._expand_recv_topk_weights = None
 
             v2_output = DeepEPNormalDispatchOutput(
                 hidden_states=recv_hidden,
@@ -1046,54 +1066,22 @@ class _DeepEPDispatcherImplV2(_DeepEPDispatcherImplBase):
 
         H = recv_hidden.shape[-1]
 
-        # V2 expand layout is COMPACT + per-expert alignment, NOT a fixed
-        # [E_local, max_m] grid. Data for expert e lives at:
-        #   start_e = align(psum_padded[e], max_m); count_e = psum_padded[e+1] - start_e
-        # where psum_padded = [0] + psum. A naive view(E_local, max_m, H) reads the
-        # wrong offsets. We scatter the compact rows into a preallocated fixed grid
-        # so that grid[e, :count_e] == expert e's real tokens (padding is garbage but
-        # unused: DeepGEMM masked GEMM only reads the first masked_m[e] rows).
-        psum = self.handle.psum_num_recv_tokens_per_expert  # inclusive, aligned prefix sum
-        psum_padded = torch.cat(
-            [psum.new_zeros(1), psum]
-        )  # [E_local + 1], psum_padded[0] = 0
+        psum = self.handle.psum_num_recv_tokens_per_expert
+        psum_padded = torch.cat([psum.new_zeros(1), psum])
 
-        # start_e = align(psum_padded[e], max_m), count_e = psum_padded[e+1] - start_e
-        starts = ((psum_padded[:-1] + max_m - 1) // max_m) * max_m  # [E_local]
-        masked_m = (psum_padded[1:] - starts).to(torch.int32)  # [E_local]
+        starts = ((psum_padded[:-1] + max_m - 1) // max_m) * max_m
+        masked_m = (psum_padded[1:] - starts).to(torch.int32)
 
-        # Scatter compact rows into the fixed grid using pure GPU ops (no .item(),
-        # no boolean indexing, no Python loops) for cuda graph compatibility.
-        total_slots = E_local * max_m
-        grid_hidden = _DeepEPDispatcherImplV2._shared_grid_hidden
+        from sglang.srt.layers.moe.ep_moe.kernels import epv2_expand_to_masked_slab
+        slab_3d = epv2_expand_to_masked_slab(recv_hidden, psum_padded, max_m, E_local)
 
-        # Build full [E_local, max_m] index grids on GPU (fixed shape, no .item())
-        row_offsets = torch.arange(max_m, device=recv_hidden.device).unsqueeze(0)  # [1, max_m]
-        src_all = starts.unsqueeze(1) + row_offsets      # [E_local, max_m] compact src indices
-        dst_all = (torch.arange(E_local, device=recv_hidden.device) * max_m).unsqueeze(1) + row_offsets  # [E_local, max_m] grid dst indices
-        valid_mask = row_offsets < masked_m.unsqueeze(1)  # [E_local, max_m] bool
+        self._expand_psum_padded = psum_padded
+        self._expand_compact_rows = recv_hidden.shape[0]
+        self._expand_recv_topk_weights = recv_topk_weights
 
-        # Clamp invalid src indices to 0 (they will be overwritten or ignored by GEMM)
-        src_flat = src_all.clamp(max=recv_hidden.shape[0] - 1).view(-1)  # [E_local*max_m]
-        dst_flat = dst_all.view(-1)                                       # [E_local*max_m]
-        valid_flat = valid_mask.view(-1)                                  # [E_local*max_m]
-
-        # Copy ALL rows (including invalid → garbage, but masked GEMM ignores them)
-        _copy_rows_by_index(grid_hidden, dst_flat, recv_hidden, src_flat)
-        slab_3d = grid_hidden.view(E_local, max_m, H)
-
-        # Save the VALID grid<->compact row maps for combine inverse gather.
-        # torch.where returns fixed-shape when given full args (no dynamic indexing).
-        # For combine we only need valid indices, but we must build them without .item().
-        # Store the full maps + mask; combine_a will filter using the mask.
-        # Save the grid<->compact row maps for combine inverse gather.
-        # For invalid rows (where valid_mask=False), set src to dst (identity mapping)
-        # so index_copy_ in combine won't have duplicate targets.
-        safe_src = torch.where(valid_mask.view(-1), src_all.view(-1), dst_flat)
-        self._expand_dst_all = dst_flat
-        self._expand_src_all = safe_src
-        self._expand_valid_mask = valid_mask.view(-1)
-        self._expand_compact_rows = psum_padded[-1]
+        # DEBUG: run V1 LL dispatch with same input for combine comparison
+        if _V2_COMBINE_DEBUG:
+            self._debug_run_v1_ll_dispatch(recv_topk_weights)
 
         slab_sf_3d = None
         if recv_sf is not None:
@@ -1106,19 +1094,10 @@ class _DeepEPDispatcherImplV2(_DeepEPDispatcherImplBase):
             else:
                 # 2D compact SF: scatter into a fixed grid the same way as hidden.
                 sf_dim = recv_sf.shape[-1]
-                if (
-                    getattr(self, "_grid_sf", None) is None
-                    or self._grid_sf.shape != (total_slots, sf_dim)
-                    or self._grid_sf.dtype != recv_sf.dtype
-                ):
-                    self._grid_sf = recv_sf.new_empty((total_slots, sf_dim))
-                grid_sf = self._grid_sf
-                sf_src = src_all.clamp(max=recv_sf.shape[0] - 1).view(-1)
-                grid_sf.index_copy_(0, dst_flat, recv_sf.index_select(0, sf_src))
-                slab_sf_3d = grid_sf.view(E_local, max_m, sf_dim)
+                slab_sf_3d = epv2_expand_to_masked_slab(recv_sf, psum_padded, max_m, E_local)
+
         expected_m = (topk_ids.shape[0] * R * num_topk + self.num_experts) // self.num_experts
         self._dispatch_ctx = {}
-        self._num_expanded_tokens = psum_padded[-1]
 
         return DeepEPLLDispatchOutput(
             hidden_states=slab_3d,
@@ -1128,6 +1107,95 @@ class _DeepEPDispatcherImplV2(_DeepEPDispatcherImplBase):
             masked_m=masked_m,
             expected_m=expected_m,
         )
+
+    def _debug_run_v1_ll_dispatch(self, recv_topk_weights):
+        """DEBUG: Run V1 LL dispatch and save handle for combine comparison."""
+        v1_buffer = DeepEPBuffer._v1_ll_buffer
+        if v1_buffer is None:
+            return
+        orig_hidden = self._debug_orig_hidden_bf16
+        topk_ids = self._debug_dedup_topk_ids
+        if orig_hidden is None or topk_ids is None:
+            return
+        try:
+            torch.cuda.synchronize()
+            v1_buffer.clean_low_latency_buffer(
+                self.num_max_dispatch_tokens_per_rank,
+                orig_hidden.shape[1], self.num_experts,
+            )
+            torch.cuda.synchronize()
+            _, v1_recv_count, v1_handle, _, _ = v1_buffer.low_latency_dispatch(
+                orig_hidden, topk_ids,
+                self.num_max_dispatch_tokens_per_rank, self.num_experts,
+                use_fp8=False, async_finish=False, return_recv_hook=False,
+            )
+            torch.cuda.synchronize()
+            self._debug_v1_handle = v1_handle
+            self._debug_v1_recv_count = v1_recv_count
+            logger.info(
+                f"[V2_COMBINE_DEBUG][rank={self.group.rank()}] V1 LL dispatch done, "
+                f"recv_count={v1_recv_count.tolist()}, "
+                f"recv_topk_weights shape={recv_topk_weights.shape if recv_topk_weights is not None else None} "
+                f"dtype={recv_topk_weights.dtype if recv_topk_weights is not None else None} "
+                f"first_8={recv_topk_weights[:8].tolist() if recv_topk_weights is not None and recv_topk_weights.numel() > 0 else []}"
+            )
+        except Exception as ex:
+            logger.error(f"[V2_COMBINE_DEBUG] V1 LL dispatch error: {ex}", exc_info=True)
+
+    def _debug_compare_v1_combine(self, v2_combined):
+        """DEBUG: Run V1 LL combine with mock data and compare with V2."""
+        v1_buffer = DeepEPBuffer._v1_ll_buffer
+        v1_handle = self._debug_v1_handle
+        v1_recv_count = self._debug_v1_recv_count
+        topk_ids = self._debug_dedup_topk_ids
+        topk_weights = self._debug_dedup_topk_weights
+        if v1_buffer is None or v1_handle is None or topk_ids is None:
+            return
+        rank = self.group.rank()
+        try:
+            torch.cuda.synchronize()
+            E_local = v1_recv_count.shape[0]
+            T_max_R = self.num_max_dispatch_tokens_per_rank * self.group.size()
+            H = v2_combined.shape[-1]
+            v1_input = torch.zeros(
+                (E_local, T_max_R, H), dtype=torch.bfloat16, device=v2_combined.device
+            )
+            for e in range(E_local):
+                cnt = v1_recv_count[e].item()
+                if cnt > 0:
+                    v1_input[e, :cnt, :] = 1.0
+
+            v1_combined, _, _ = v1_buffer.low_latency_combine(
+                x=v1_input, topk_idx=topk_ids, topk_weights=topk_weights,
+                handle=v1_handle, async_finish=False, return_recv_hook=False,
+            )
+            torch.cuda.synchronize()
+
+            abs_diff = (v2_combined.float() - v1_combined.float()).abs()
+            max_diff = abs_diff.max().item()
+            mean_diff = abs_diff.mean().item()
+            if max_diff < 1e-4:
+                logger.info(
+                    f"[V2_COMBINE_DEBUG][rank={rank}] COMBINE MATCH: "
+                    f"max_diff={max_diff:.6g} mean_diff={mean_diff:.6g}\n"
+                    f"  V2[:8]={v2_combined[0, :8].tolist()}\n"
+                    f"  V1[:8]={v1_combined[0, :8].tolist()}"
+                )
+            else:
+                logger.warning(
+                    f"[V2_COMBINE_DEBUG][rank={rank}] COMBINE MISMATCH: "
+                    f"max_diff={max_diff:.6f} mean_diff={mean_diff:.6f}\n"
+                    f"  V2[:8]={v2_combined[0, :8].tolist()}\n"
+                    f"  V1[:8]={v1_combined[0, :8].tolist()}"
+                )
+        except Exception as ex:
+            logger.error(f"[V2_COMBINE_DEBUG][rank={rank}] error: {ex}", exc_info=True)
+        finally:
+            self._debug_v1_handle = None
+            self._debug_v1_recv_count = None
+            self._debug_dedup_topk_ids = None
+            self._debug_dedup_topk_weights = None
+            self._debug_orig_hidden_bf16 = None
 
     def _dispatch_core(
         self,
@@ -1209,21 +1277,30 @@ class _DeepEPDispatcherImplV2(_DeepEPDispatcherImplBase):
         else:
             raise NotImplementedError()
 
-        if output.dim() == 3:
-            output = output.view(-1, output.shape[-1])
-
-        expand_dst_all = getattr(self, "_expand_dst_all", None)
-        if expand_dst_all is not None:
-            src_all = self._expand_src_all
-            dst_expanded = expand_dst_all.unsqueeze(1).expand_as(output)
-            src_expanded = src_all.unsqueeze(1).expand_as(output)
-            compact = _DeepEPDispatcherImplV2._shared_combine_compact_buf
-            compact.zero_()
-            compact.scatter_(0, src_expanded, output.gather(0, dst_expanded))
-            output = compact
-            self._expand_dst_all = None
-            self._expand_src_all = None
-            self._expand_valid_mask = None
+        psum_padded = getattr(self, "_expand_psum_padded", None)
+        if psum_padded is not None:
+            if output.dim() == 3:
+                E_local, max_m, H = output.shape
+            else:
+                E_local = self.num_local_experts
+                max_m = output.shape[0] // E_local
+                H = output.shape[-1]
+            compact_rows = self._expand_compact_rows
+            recv_topk_weights = getattr(self, "_expand_recv_topk_weights", None)
+            if recv_topk_weights is not None and recv_topk_weights.numel() > 0:
+                from sglang.srt.layers.moe.ep_moe.kernels import epv2_masked_slab_to_expand_weighted
+                output = epv2_masked_slab_to_expand_weighted(
+                    output.view(E_local, max_m, H),
+                    psum_padded, max_m, compact_rows, recv_topk_weights,
+                )
+                self._expand_recv_topk_weights = None
+            else:
+                from sglang.srt.layers.moe.ep_moe.kernels import epv2_masked_slab_to_expand
+                output = epv2_masked_slab_to_expand(
+                    output.view(E_local, max_m, H),
+                    psum_padded, max_m, compact_rows,
+                )
+            self._expand_psum_padded = None
 
         self._combine_topk_weights = topk_weights
         self._combine_use_async = self.async_finish and not getattr(self, '_prefill_sync_mode', False)
@@ -1251,15 +1328,19 @@ class _DeepEPDispatcherImplV2(_DeepEPDispatcherImplBase):
         if overlap_args is not None:
             self.device_module.current_stream().wait_stream(overlap_args.stream)
 
+        if _V2_COMBINE_DEBUG and not getattr(self, '_prefill_sync_mode', False):
+            self._debug_compare_v1_combine(hidden_states)
+
         return hidden_states
 
     def _combine_core(self, x: torch.Tensor, previous_event):
         buffer = self._get_buffer()
         _deepep_precompile_tp_barrier()
 
-        topk_weights = getattr(self, '_combine_topk_weights', None)
-        if self.handle is not None and self.handle.do_expand:
-            topk_weights = None
+        # V2 ElasticBuffer combine does pure summation in all modes.
+        # topk_weights are pre-multiplied by the caller (combine_a for decode,
+        # ep_gather for prefill), so always pass None here.
+        topk_weights = None
 
         use_async = getattr(self, '_combine_use_async', self.async_finish)
 
