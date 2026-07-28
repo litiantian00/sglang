@@ -89,8 +89,6 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 logger = logging.getLogger(__name__)
 
-_V2_COMBINE_DEBUG = get_bool_env_var("SGLANG_V2_COMBINE_DEBUG", default="false")
-
 
 def _copy_rows_by_index(
     dst: torch.Tensor,
@@ -254,7 +252,6 @@ class DeepEPDispatchMode(IntEnum):
 
 class DeepEPBuffer:
     _buffer = None
-    _v1_ll_buffer = None
     _dispatch_mode: Optional[DeepEPDispatchMode] = None
     _hidden_size: Optional[int] = None
     _num_max_dispatch_tokens_per_rank: Optional[int] = None
@@ -394,24 +391,6 @@ class DeepEPBuffer:
             use_fp8,
             allow_multiple_reduction,
         )
-
-        if _V2_COMBINE_DEBUG and cls._v1_ll_buffer is None:
-            num_rdma_bytes = Buffer.get_low_latency_rdma_size_hint(
-                num_max_dispatch_tokens_per_rank,
-                hidden_size,
-                group.size(),
-                num_experts,
-            )
-            num_qps_per_rank = num_experts // group.size()
-            logger.info(
-                "[V2_COMBINE_DEBUG] Creating V1 LL Buffer for combine comparison"
-            )
-            cls._v1_ll_buffer = Buffer(
-                group, 0, num_rdma_bytes,
-                low_latency_mode=True,
-                num_qps_per_rank=num_qps_per_rank,
-                allow_mnnvl=True,
-            )
 
         return ElasticBuffer(
             group=group,
@@ -965,11 +944,6 @@ class _DeepEPDispatcherImplV2(_DeepEPDispatcherImplBase):
         self._expand_psum_padded = None
         self._expand_compact_rows = None
         self._expand_recv_topk_weights = None
-        self._debug_v1_handle = None
-        self._debug_v1_recv_count = None
-        self._debug_dedup_topk_ids = None
-        self._debug_dedup_topk_weights = None
-        self._debug_orig_hidden_bf16 = None
 
     def dispatch_a(
         self,
@@ -981,17 +955,9 @@ class _DeepEPDispatcherImplV2(_DeepEPDispatcherImplBase):
 
         is_extend = get_is_extend_in_batch()
 
-        # DEBUG: save for V1 LL combine comparison
-        if _V2_COMBINE_DEBUG and not is_extend:
-            self._debug_orig_hidden_bf16 = hidden_states.clone()
-
         all_zero_mask = (topk_ids == 0).all(dim=1)
         topk_ids = topk_ids.masked_fill(all_zero_mask.unsqueeze(1), -1)
         topk_weights = topk_weights.masked_fill(all_zero_mask.unsqueeze(1), 0.0)
-
-        if _V2_COMBINE_DEBUG and not is_extend:
-            self._debug_dedup_topk_ids = topk_ids.clone()
-            self._debug_dedup_topk_weights = topk_weights.clone()
 
         backend = get_moe_runner_backend()
         need_bf16_dispatch = backend.is_cutlass() or (
@@ -1079,10 +1045,6 @@ class _DeepEPDispatcherImplV2(_DeepEPDispatcherImplBase):
         self._expand_compact_rows = recv_hidden.shape[0]
         self._expand_recv_topk_weights = recv_topk_weights
 
-        # DEBUG: run V1 LL dispatch with same input for combine comparison
-        if _V2_COMBINE_DEBUG:
-            self._debug_run_v1_ll_dispatch(recv_topk_weights)
-
         slab_sf_3d = None
         if recv_sf is not None:
             if recv_sf.dim() == 3:
@@ -1107,95 +1069,6 @@ class _DeepEPDispatcherImplV2(_DeepEPDispatcherImplBase):
             masked_m=masked_m,
             expected_m=expected_m,
         )
-
-    def _debug_run_v1_ll_dispatch(self, recv_topk_weights):
-        """DEBUG: Run V1 LL dispatch and save handle for combine comparison."""
-        v1_buffer = DeepEPBuffer._v1_ll_buffer
-        if v1_buffer is None:
-            return
-        orig_hidden = self._debug_orig_hidden_bf16
-        topk_ids = self._debug_dedup_topk_ids
-        if orig_hidden is None or topk_ids is None:
-            return
-        try:
-            torch.cuda.synchronize()
-            v1_buffer.clean_low_latency_buffer(
-                self.num_max_dispatch_tokens_per_rank,
-                orig_hidden.shape[1], self.num_experts,
-            )
-            torch.cuda.synchronize()
-            _, v1_recv_count, v1_handle, _, _ = v1_buffer.low_latency_dispatch(
-                orig_hidden, topk_ids,
-                self.num_max_dispatch_tokens_per_rank, self.num_experts,
-                use_fp8=False, async_finish=False, return_recv_hook=False,
-            )
-            torch.cuda.synchronize()
-            self._debug_v1_handle = v1_handle
-            self._debug_v1_recv_count = v1_recv_count
-            logger.info(
-                f"[V2_COMBINE_DEBUG][rank={self.group.rank()}] V1 LL dispatch done, "
-                f"recv_count={v1_recv_count.tolist()}, "
-                f"recv_topk_weights shape={recv_topk_weights.shape if recv_topk_weights is not None else None} "
-                f"dtype={recv_topk_weights.dtype if recv_topk_weights is not None else None} "
-                f"first_8={recv_topk_weights[:8].tolist() if recv_topk_weights is not None and recv_topk_weights.numel() > 0 else []}"
-            )
-        except Exception as ex:
-            logger.error(f"[V2_COMBINE_DEBUG] V1 LL dispatch error: {ex}", exc_info=True)
-
-    def _debug_compare_v1_combine(self, v2_combined):
-        """DEBUG: Run V1 LL combine with mock data and compare with V2."""
-        v1_buffer = DeepEPBuffer._v1_ll_buffer
-        v1_handle = self._debug_v1_handle
-        v1_recv_count = self._debug_v1_recv_count
-        topk_ids = self._debug_dedup_topk_ids
-        topk_weights = self._debug_dedup_topk_weights
-        if v1_buffer is None or v1_handle is None or topk_ids is None:
-            return
-        rank = self.group.rank()
-        try:
-            torch.cuda.synchronize()
-            E_local = v1_recv_count.shape[0]
-            T_max_R = self.num_max_dispatch_tokens_per_rank * self.group.size()
-            H = v2_combined.shape[-1]
-            v1_input = torch.zeros(
-                (E_local, T_max_R, H), dtype=torch.bfloat16, device=v2_combined.device
-            )
-            for e in range(E_local):
-                cnt = v1_recv_count[e].item()
-                if cnt > 0:
-                    v1_input[e, :cnt, :] = 1.0
-
-            v1_combined, _, _ = v1_buffer.low_latency_combine(
-                x=v1_input, topk_idx=topk_ids, topk_weights=topk_weights,
-                handle=v1_handle, async_finish=False, return_recv_hook=False,
-            )
-            torch.cuda.synchronize()
-
-            abs_diff = (v2_combined.float() - v1_combined.float()).abs()
-            max_diff = abs_diff.max().item()
-            mean_diff = abs_diff.mean().item()
-            if max_diff < 1e-4:
-                logger.info(
-                    f"[V2_COMBINE_DEBUG][rank={rank}] COMBINE MATCH: "
-                    f"max_diff={max_diff:.6g} mean_diff={mean_diff:.6g}\n"
-                    f"  V2[:8]={v2_combined[0, :8].tolist()}\n"
-                    f"  V1[:8]={v1_combined[0, :8].tolist()}"
-                )
-            else:
-                logger.warning(
-                    f"[V2_COMBINE_DEBUG][rank={rank}] COMBINE MISMATCH: "
-                    f"max_diff={max_diff:.6f} mean_diff={mean_diff:.6f}\n"
-                    f"  V2[:8]={v2_combined[0, :8].tolist()}\n"
-                    f"  V1[:8]={v1_combined[0, :8].tolist()}"
-                )
-        except Exception as ex:
-            logger.error(f"[V2_COMBINE_DEBUG][rank={rank}] error: {ex}", exc_info=True)
-        finally:
-            self._debug_v1_handle = None
-            self._debug_v1_recv_count = None
-            self._debug_dedup_topk_ids = None
-            self._debug_dedup_topk_weights = None
-            self._debug_orig_hidden_bf16 = None
 
     def _dispatch_core(
         self,
@@ -1327,9 +1200,6 @@ class _DeepEPDispatcherImplV2(_DeepEPDispatcherImplBase):
 
         if overlap_args is not None:
             self.device_module.current_stream().wait_stream(overlap_args.stream)
-
-        if _V2_COMBINE_DEBUG and not getattr(self, '_prefill_sync_mode', False):
-            self._debug_compare_v1_combine(hidden_states)
 
         return hidden_states
 
