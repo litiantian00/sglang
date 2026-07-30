@@ -70,6 +70,11 @@ class StandaloneDraftWorker(EagleDraftWorker):
             server_args.speculative_algorithm
         )
 
+        # Pre-allocated constants for the topk=1 chain fast path in draft_forward.
+        self._topk1_parents_prealloc = None
+        self._topk1_score_indices_prealloc = None
+        self._rebuild_topk1_chain_buffers()
+
         # Set constant
         from sglang.srt.speculative.eagle_info import EagleDraftInput
 
@@ -93,7 +98,7 @@ class StandaloneDraftWorker(EagleDraftWorker):
                 server_args=server_args,
                 gpu_id=gpu_id,
                 tp_rank=tp_rank,
-                pp_rank=0,  # FIXME
+                pp_rank=0,  # spec workers don't support pipeline parallelism
                 dp_rank=dp_rank,
                 moe_ep_rank=moe_ep_rank,
                 attn_cp_rank=attn_cp_rank,
@@ -107,6 +112,15 @@ class StandaloneDraftWorker(EagleDraftWorker):
 
         # Alias for better readability
         self.draft_runner = self.draft_worker.model_runner
+        # draft_forward reads this (set in EagleDraftWorker.__init__, skipped here).
+        self.index_share_for_mtp_iteration = (
+            getattr(
+                self.draft_runner.model_config.hf_config,
+                "index_share_for_mtp_iteration",
+                False,
+            )
+            and self.topk == 1
+        )
 
         self.init_token_map()
         self.init_lm_head()
